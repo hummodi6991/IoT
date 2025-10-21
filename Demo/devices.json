@@ -1,0 +1,22 @@
+{
+  "devices": [
+    {
+      "id": "A1",
+      "name": "Almadinah - Studio 10",
+      "online": true,
+      "battery": 100
+    },
+    {
+      "id": "A2",
+      "name": "Apartment 1 - Almadinah",
+      "online": true,
+      "battery": 92
+    },
+    {
+      "id": "B9",
+      "name": "B9 - Nada",
+      "online": false,
+      "battery": 45
+    }
+  ]
+}
