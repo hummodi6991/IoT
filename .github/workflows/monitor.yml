@@ -41,6 +41,8 @@ jobs:
           FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
           TO_EMAILS: ${{ secrets.TO_EMAILS }}
           BOOMNOW_API_KEY: ${{ secrets.BOOMNOW_API_KEY }}          # leave empty if not used
+          BOOMNOW_AUTH_HEADER: ${{ secrets.BOOMNOW_AUTH_HEADER }}
+          BOOMNOW_COOKIE: ${{ secrets.BOOMNOW_COOKIE }}
           BOOMNOW_USERNAME: ${{ secrets.BOOMNOW_USERNAME }}        # using Basic auth
           BOOMNOW_PASSWORD: ${{ secrets.BOOMNOW_PASSWORD }}
         run: |
