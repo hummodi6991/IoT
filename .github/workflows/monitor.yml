@@ -32,6 +32,8 @@ jobs:
           BATTERY_LOW_THRESHOLD: ${{ vars.BATTERY_LOW_THRESHOLD }}
           BOOMNOW_BASE_URL: ${{ vars.BOOMNOW_BASE_URL }}
           BOOMNOW_DEVICES_ENDPOINT: ${{ vars.BOOMNOW_DEVICES_ENDPOINT }}
+          BOOMNOW_LOGIN_URL: ${{ vars.BOOMNOW_LOGIN_URL }}
+          BOOMNOW_LOGIN_KIND: ${{ vars.BOOMNOW_LOGIN_KIND }}
 
           # Secrets (credentials)
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
@@ -41,9 +43,7 @@ jobs:
           FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
           TO_EMAILS: ${{ secrets.TO_EMAILS }}
           BOOMNOW_API_KEY: ${{ secrets.BOOMNOW_API_KEY }}          # leave empty if not used
-          BOOMNOW_AUTH_HEADER: ${{ secrets.BOOMNOW_AUTH_HEADER }}
-          BOOMNOW_COOKIE: ${{ secrets.BOOMNOW_COOKIE }}
-          BOOMNOW_USERNAME: ${{ secrets.BOOMNOW_USERNAME }}        # using Basic auth
+          BOOMNOW_EMAIL: ${{ secrets.BOOMNOW_EMAIL }}
           BOOMNOW_PASSWORD: ${{ secrets.BOOMNOW_PASSWORD }}
         run: |
           python - <<'PY'
