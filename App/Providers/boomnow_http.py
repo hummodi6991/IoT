@@ -1,82 +1,114 @@
-
-import os, requests
+import os, re, requests
 from typing import List
 from app.device import Device
 from .base import DeviceStatusProvider
 
-# This is a thin, configurable HTTP client. Adapt the JSON mapping below to fit your platform.
 BASE_URL = os.environ.get("BOOMNOW_BASE_URL", "").rstrip("/")
-DEVICES_ENDPOINT = os.environ.get("BOOMNOW_DEVICES_ENDPOINT", "/api/devices")  # e.g., '/api/devices'
-API_KEY = os.environ.get("BOOMNOW_API_KEY")
-USERNAME = os.environ.get("BOOMNOW_USERNAME")
-PASSWORD = os.environ.get("BOOMNOW_PASSWORD")
-AUTH_HEADER = os.environ.get("BOOMNOW_AUTH_HEADER")   # e.g., "Authorization: Bearer eyJ..."
-COOKIE = os.environ.get("BOOMNOW_COOKIE")             # full cookie string from DevTools (temporary)
+DEVICES_ENDPOINT = os.environ.get("BOOMNOW_DEVICES_ENDPOINT", "/api/devices")
 
-HEADERS = {"Accept": "application/json", "User-Agent": "iot-monitor/1.0"}
-if AUTH_HEADER:  # Highest precedence: explicit header from DevTools
-    name, _, value = AUTH_HEADER.partition(":")
-    if name and value:
-        HEADERS[name.strip()] = value.strip()
-elif API_KEY:    # Preferred for CI: stable API key/token
-    HEADERS["Authorization"] = f"Bearer {API_KEY}"
-elif COOKIE:     # Temporary fallback: browser session cookie
-    HEADERS["Cookie"] = COOKIE
+# Preferred: long-lived token if you ever get one
+API_KEY = os.environ.get("BOOMNOW_API_KEY")
+
+# Programmatic sign-in (service account)
+LOGIN_URL = os.environ.get("BOOMNOW_LOGIN_URL")
+LOGIN_KIND = (os.environ.get("BOOMNOW_LOGIN_KIND") or "form").lower()  # "json" or "form"
+EMAIL = os.environ.get("BOOMNOW_EMAIL")
+PASSWORD = os.environ.get("BOOMNOW_PASSWORD")
+
+DEFAULT_HEADERS = {"Accept": "application/json", "User-Agent": "iot-monitor/1.0"}
+
+def _extract_csrf(html: str):
+    m = re.search(r'<meta[^>]+name=["\']csrf-token["\'][^>]+content=["\']([^"\']+)["\']', html, re.I)
+    if m:
+        return m.group(1)
+    m = re.search(r'name=["\']authenticity_token["\'][^>]*value=["\']([^"\']+)["\']', html, re.I)
+    return m.group(1) if m else None
+
+def _login_session() -> requests.Session:
+    if not (LOGIN_URL and EMAIL and PASSWORD):
+        raise RuntimeError("Service login requested but BOOMNOW_LOGIN_URL/EMAIL/PASSWORD not set")
+    s = requests.Session()
+    s.headers.update({"User-Agent": DEFAULT_HEADERS["User-Agent"]})
+
+    if LOGIN_KIND == "json":
+        # JSON login: {"email": "...", "password": "..."}
+        resp = s.post(LOGIN_URL, json={"email": EMAIL, "password": PASSWORD}, timeout=30, allow_redirects=True)
+        resp.raise_for_status()
+        return s
+
+    # HTML/form login with CSRF
+    getp = s.get(LOGIN_URL, timeout=30)
+    getp.raise_for_status()
+    csrf = _extract_csrf(getp.text)
+
+    # Default fields
+    form = {"email": EMAIL, "password": PASSWORD}
+    # Support Rails-style nested fields if present
+    if re.search(r'name=["\']user\[email\]["\']', getp.text, re.I):
+        form = {"user[email]": EMAIL, "user[password]": PASSWORD}
+    if csrf:
+        form["authenticity_token"] = csrf
+
+    headers = {"Referer": LOGIN_URL, "Origin": BASE_URL or LOGIN_URL.split("/api")[0]}
+    postp = s.post(LOGIN_URL, data=form, headers=headers, timeout=30, allow_redirects=True)
+    postp.raise_for_status()
+    return s
 
 class BoomNowHttpProvider(DeviceStatusProvider):
     def get_devices(self) -> List[Device]:
         if not BASE_URL:
             raise RuntimeError("BOOMNOW_BASE_URL must be set for boomnow_http provider")
-        url = f"{BASE_URL}{DEVICES_ENDPOINT}"
-        auth = None
-        # Only use Basic when no explicit header/ApiKey/cookie are provided
-        if USERNAME and PASSWORD and not (AUTH_HEADER or API_KEY or COOKIE):
-            auth = (USERNAME, PASSWORD)
 
-        r = requests.get(url, headers=HEADERS, auth=auth, timeout=30)
+        url = f"{BASE_URL}{DEVICES_ENDPOINT}"
+        headers = dict(DEFAULT_HEADERS)
+
+        # 1) Use API key if you have one in the future
+        if API_KEY:
+            headers["Authorization"] = f"Bearer {API_KEY}"
+            r = requests.get(url, headers=headers, timeout=30)
+        else:
+            # 2) Programmatic login each run
+            session = _login_session()
+            headers.setdefault("Origin", BASE_URL)
+            headers.setdefault("Referer", BASE_URL + "/dashboard/iot")
+            r = session.get(url, headers=headers, timeout=30)
+
         try:
             r.raise_for_status()
         except requests.HTTPError as e:
-            # Add a helpful hint in logs for 401s
             if r.status_code == 401:
-                raise RuntimeError(
-                    f"401 Unauthorized calling {url}. "
-                    f"Set BOOMNOW_API_KEY (preferred), or BOOMNOW_AUTH_HEADER "
-                    f'(e.g., "Authorization: Bearer <token>"), or BOOMNOW_COOKIE.'
-                ) from e
+                raise RuntimeError("401 Unauthorized: check service creds / LOGIN_KIND / LOGIN_URL") from e
             raise
+
         payload = r.json()
 
-        # ---- Map the platform's JSON into a normalized list of Device objects.
-        # Common shapes:
-        # 1) payload is a list of devices
-        # 2) payload is { "devices": [ ... ] }
+        # Normalize payload to a list
         if isinstance(payload, dict) and "devices" in payload:
             items = payload["devices"]
         elif isinstance(payload, list):
             items = payload
         else:
-            # Try a common alternative
             items = payload.get("results", []) if isinstance(payload, dict) else []
 
-        devices: List[Device] = []
+        out: List[Device] = []
         for item in items:
-            # TODO: adjust the following field mappings to your platform
-            # Try common keys with fallbacks
             did = str(item.get("id") or item.get("deviceId") or item.get("uuid") or "")
             name = item.get("name") or item.get("label") or item.get("deviceName") or did
+
             online_raw = item.get("online")
             if online_raw is None:
-                # Try alternate names
-                online_raw = item.get("isOnline") or item.get("status") in ("online", "ONLINE", "connected", "up")
+                online_raw = (
+                    item.get("isOnline")
+                    or item.get("connected")
+                    or (item.get("status") in ("online", "ONLINE", "connected", "up"))
+                )
             online = bool(online_raw)
+
             battery = None
-            # Try to pull a battery percentage if present
             for k in ("battery", "batteryPercent", "battery_percentage", "batteryLevel"):
                 if k in item and isinstance(item[k], (int, float)):
                     battery = int(item[k])
                     break
 
-            devices.append(Device(id=did, name=name, online=online, battery=battery, extra=item))
-
-        return devices
+            out.append(Device(id=did, name=name, online=online, battery=battery, extra=item))
+        return out
