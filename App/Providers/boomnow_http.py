@@ -55,27 +55,21 @@ def _login_session() -> requests.Session:
     return s
 
 def _coerce_online(value: Union[str, int, float, bool, None]) -> bool:
-    """Convert assorted truthy/falsy API values into a boolean.
-
-    The BoomNow API has been observed to return strings such as "inactive" when a
-    device is offline.  `bool("inactive")` evaluates to ``True``, so we need to
-    explicitly interpret the textual status values to avoid treating offline
-    devices as online and skipping alerts.
-    """
-
+    # Accept real booleans and 0/1 first
     if isinstance(value, bool):
         return value
-
     if isinstance(value, (int, float)):
         return value != 0
 
+    # Handle common status strings
     if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized in {"true", "1", "yes", "online", "up", "connected", "active"}:
+        v = value.strip().lower()
+        if v in {"true", "1", "yes", "online", "up", "connected", "active"}:
             return True
-        if normalized in {"false", "0", "no", "offline", "down", "inactive", "disconnected"}:
+        if v in {"false", "0", "no", "offline", "down", "inactive", "disconnected"}:
             return False
 
+    # Fallback – truthiness
     return bool(value)
 
 
