@@ -1,5 +1,5 @@
 import os, re, requests
-from typing import List
+from typing import List, Union
 from app.device import Device
 from .base import DeviceStatusProvider
 
@@ -54,6 +54,31 @@ def _login_session() -> requests.Session:
     postp.raise_for_status()
     return s
 
+def _coerce_online(value: Union[str, int, float, bool, None]) -> bool:
+    """Convert assorted truthy/falsy API values into a boolean.
+
+    The BoomNow API has been observed to return strings such as "inactive" when a
+    device is offline.  `bool("inactive")` evaluates to ``True``, so we need to
+    explicitly interpret the textual status values to avoid treating offline
+    devices as online and skipping alerts.
+    """
+
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, (int, float)):
+        return value != 0
+
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "online", "up", "connected", "active"}:
+            return True
+        if normalized in {"false", "0", "no", "offline", "down", "inactive", "disconnected"}:
+            return False
+
+    return bool(value)
+
+
 class BoomNowHttpProvider(DeviceStatusProvider):
     def get_devices(self) -> List[Device]:
         if not BASE_URL:
@@ -102,7 +127,7 @@ class BoomNowHttpProvider(DeviceStatusProvider):
                     or item.get("connected")
                     or (item.get("status") in ("online", "ONLINE", "connected", "up"))
                 )
-            online = bool(online_raw)
+            online = _coerce_online(online_raw)
 
             battery = None
             for k in ("battery", "batteryPercent", "battery_percentage", "batteryLevel"):
