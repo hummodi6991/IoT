@@ -10,11 +10,18 @@ DEVICES_ENDPOINT = os.environ.get("BOOMNOW_DEVICES_ENDPOINT", "/api/devices")  #
 API_KEY = os.environ.get("BOOMNOW_API_KEY")
 USERNAME = os.environ.get("BOOMNOW_USERNAME")
 PASSWORD = os.environ.get("BOOMNOW_PASSWORD")
+AUTH_HEADER = os.environ.get("BOOMNOW_AUTH_HEADER")   # e.g., "Authorization: Bearer eyJ..."
+COOKIE = os.environ.get("BOOMNOW_COOKIE")             # full cookie string from DevTools (temporary)
 
-HEADERS = {}
-if API_KEY:
+HEADERS = {"Accept": "application/json", "User-Agent": "iot-monitor/1.0"}
+if AUTH_HEADER:  # Highest precedence: explicit header from DevTools
+    name, _, value = AUTH_HEADER.partition(":")
+    if name and value:
+        HEADERS[name.strip()] = value.strip()
+elif API_KEY:    # Preferred for CI: stable API key/token
     HEADERS["Authorization"] = f"Bearer {API_KEY}"
-HEADERS["Accept"] = "application/json"
+elif COOKIE:     # Temporary fallback: browser session cookie
+    HEADERS["Cookie"] = COOKIE
 
 class BoomNowHttpProvider(DeviceStatusProvider):
     def get_devices(self) -> List[Device]:
@@ -22,11 +29,22 @@ class BoomNowHttpProvider(DeviceStatusProvider):
             raise RuntimeError("BOOMNOW_BASE_URL must be set for boomnow_http provider")
         url = f"{BASE_URL}{DEVICES_ENDPOINT}"
         auth = None
-        if USERNAME and PASSWORD:
+        # Only use Basic when no explicit header/ApiKey/cookie are provided
+        if USERNAME and PASSWORD and not (AUTH_HEADER or API_KEY or COOKIE):
             auth = (USERNAME, PASSWORD)
 
         r = requests.get(url, headers=HEADERS, auth=auth, timeout=30)
-        r.raise_for_status()
+        try:
+            r.raise_for_status()
+        except requests.HTTPError as e:
+            # Add a helpful hint in logs for 401s
+            if r.status_code == 401:
+                raise RuntimeError(
+                    f"401 Unauthorized calling {url}. "
+                    f"Set BOOMNOW_API_KEY (preferred), or BOOMNOW_AUTH_HEADER "
+                    f'(e.g., "Authorization: Bearer <token>"), or BOOMNOW_COOKIE.'
+                ) from e
+            raise
         payload = r.json()
 
         # ---- Map the platform's JSON into a normalized list of Device objects.
