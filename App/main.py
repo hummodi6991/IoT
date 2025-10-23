@@ -11,6 +11,7 @@ PROVIDER = os.environ.get("PROVIDER", "demo").lower()  # 'demo' or 'boomnow_http
 ALERT_COOLDOWN_MINUTES = int(os.environ.get("ALERT_COOLDOWN_MINUTES", "240"))
 OFFLINE_GRACE_MINUTES = int(os.environ.get("OFFLINE_GRACE_MINUTES", "0"))
 BATTERY_LOW_THRESHOLD = int(os.environ.get("BATTERY_LOW_THRESHOLD", "0"))  # 0 = disabled
+STRICT_EMAIL = (os.environ.get("STRICT_EMAIL", "1") == "1")
 
 def provider():
     if PROVIDER == "demo":
@@ -55,6 +56,10 @@ def alert_low_battery(d: Device):
 def main():
     p = provider()
     devices = p.get_devices()
+    print(f"[monitor] provider={PROVIDER} fetched {len(devices)} devices", flush=True)
+    if devices:
+        offline = [d for d in devices if d.online is False]
+        print(f"[monitor] offline_count={len(offline)}", flush=True)
     state: Dict = load_state()
     now = now_ts()
     changed = False
@@ -82,16 +87,28 @@ def main():
                     alert_offline(d)
                     s["last_offline_alert_ts"] = now
                     changed = True
-                except Exception:
+                except Exception as exc:
                     traceback.print_exc()
+                    print(
+                        f"[email] offline alert failed for device={d.id} name={d.name}: {exc}",
+                        flush=True,
+                    )
+                    if STRICT_EMAIL:
+                        raise
 
         # Recovery logic
         if last_status is False and d.online is True:
             try:
                 alert_recovered(d)
                 changed = True
-            except Exception:
+            except Exception as exc:
                 traceback.print_exc()
+                print(
+                    f"[email] recovery alert failed for device={d.id} name={d.name}: {exc}",
+                    flush=True,
+                )
+                if STRICT_EMAIL:
+                    raise
 
         # Low battery logic (optional)
         if BATTERY_LOW_THRESHOLD and d.battery is not None and d.battery <= BATTERY_LOW_THRESHOLD:
@@ -101,8 +118,14 @@ def main():
                     alert_low_battery(d)
                     s["last_battery_alert_ts"] = now
                     changed = True
-                except Exception:
+                except Exception as exc:
                     traceback.print_exc()
+                    print(
+                        f"[email] low battery alert failed for device={d.id} name={d.name}: {exc}",
+                        flush=True,
+                    )
+                    if STRICT_EMAIL:
+                        raise
 
         # Save back any updates
         state[d.id] = s

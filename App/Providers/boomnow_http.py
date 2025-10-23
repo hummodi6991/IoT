@@ -66,7 +66,7 @@ def _coerce_online(value: Union[str, int, float, bool, None]) -> bool:
         v = value.strip().lower()
         if v in {"true", "1", "yes", "online", "up", "connected", "active"}:
             return True
-        if v in {"false", "0", "no", "offline", "down", "inactive", "disconnected"}:
+        if v in {"false", "0", "no", "offline", "down", "inactive", "disconnected", "no data", "unknown", "n/a"}:
             return False
 
     # Fallback – truthiness
