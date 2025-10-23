@@ -23,21 +23,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: SMTP test
-        env:
-          SMTP_HOST: ${{ secrets.SMTP_HOST }}
-          SMTP_PORT: ${{ secrets.SMTP_PORT }}
-          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
-          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
-          FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
-          TO_EMAILS: ${{ secrets.TO_EMAILS }}
-        run: |
-          python - <<'PY'
-          from app.notify.emailer import send_email
-          send_email("IoT monitor SMTP test", "<p>If you see this, SMTP works.</p>")
-          print("SMTP test email attempted.")
-          PY
-
       - name: Run monitor
         env:
           # Non-secret config (from Repository Variables)

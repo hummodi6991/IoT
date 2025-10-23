@@ -64,9 +64,26 @@ def _coerce_online(value: Union[str, int, float, bool, None]) -> bool:
     # Handle common status strings
     if isinstance(value, str):
         v = value.strip().lower()
-        if v in {"true", "1", "yes", "online", "up", "connected", "active"}:
+        if v in {"true", "1", "yes", "online", "up", "connected", "active", "alive"}:
             return True
-        if v in {"false", "0", "no", "offline", "down", "inactive", "disconnected", "no data", "unknown", "n/a"}:
+        if v in {
+            "false",
+            "0",
+            "no",
+            "offline",
+            "down",
+            "inactive",
+            "disconnected",
+            "no data",
+            "unknown",
+            "n/a",
+            "na",
+            "not available",
+            "none",
+            "null",
+            "—",
+            "-",
+        }:
             return False
 
     # Fallback – truthiness
@@ -114,13 +131,30 @@ class BoomNowHttpProvider(DeviceStatusProvider):
             did = str(item.get("id") or item.get("deviceId") or item.get("uuid") or "")
             name = item.get("name") or item.get("label") or item.get("deviceName") or did
 
+            # derive "online" from whatever the API returns
             online_raw = item.get("online")
             if online_raw is None:
-                online_raw = (
-                    item.get("isOnline")
-                    or item.get("connected")
-                    or (item.get("status") in ("online", "ONLINE", "connected", "up"))
+                online_raw = item.get("isOnline")
+            if online_raw is None:
+                online_raw = item.get("connected")
+            if online_raw is None and "status" in item:
+                # many APIs use textual status: "online"/"offline"
+                online_raw = str(item.get("status"))
+            if online_raw is None:
+                # some APIs expose a color/text indicator instead
+                indicator = (
+                    item.get("statusColor")
+                    or item.get("status_color")
+                    or item.get("indicator")
+                    or item.get("onlineColor")
+                    or item.get("statusDot")
                 )
+                if indicator:
+                    sv = str(indicator).strip().lower()
+                    if sv in {"green", "success", "ok"}:
+                        online_raw = True
+                    elif sv in {"red", "danger", "error"}:
+                        online_raw = False
             online = _coerce_online(online_raw)
 
             battery = None

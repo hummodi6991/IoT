@@ -56,10 +56,8 @@ def alert_low_battery(d: Device):
 def main():
     p = provider()
     devices = p.get_devices()
-    print(f"[monitor] provider={PROVIDER} fetched {len(devices)} devices", flush=True)
-    if devices:
-        offline = [d for d in devices if d.online is False]
-        print(f"[monitor] offline_count={len(offline)}", flush=True)
+    print(f"[monitor] fetched {len(devices)} devices")
+    print(f"[monitor] offline_count={sum(1 for d in devices if d.online is False)}")
     state: Dict = load_state()
     now = now_ts()
     changed = False
