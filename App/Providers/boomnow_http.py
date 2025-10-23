@@ -1,4 +1,4 @@
-import os, re, requests
+import os, re, json, requests
 from typing import List, Union, Any
 from app.device import Device
 from .base import DeviceStatusProvider
@@ -7,6 +7,8 @@ BASE_URL = os.environ.get("BOOMNOW_BASE_URL", "").rstrip("/")
 DEVICES_ENDPOINT = os.environ.get("BOOMNOW_DEVICES_ENDPOINT", "/api/devices")
 DEVICES_JSON_PATH = (os.environ.get("BOOMNOW_DEVICES_JSON_PATH") or "").strip()
 DEBUG_PROVIDER = (os.environ.get("DEBUG_PROVIDER", "0") == "1")
+DEVICES_QUERY = (os.environ.get("BOOMNOW_DEVICES_QUERY") or "").lstrip("?")
+EXTRA_HEADERS = os.environ.get("BOOMNOW_EXTRA_HEADERS")  # JSON dict, optional
 
 # Preferred: long-lived token if you ever get one
 API_KEY = os.environ.get("BOOMNOW_API_KEY")
@@ -138,8 +140,17 @@ class BoomNowHttpProvider(DeviceStatusProvider):
         if not BASE_URL:
             raise RuntimeError("BOOMNOW_BASE_URL must be set for boomnow_http provider")
 
+        # Build URL (optionally append query params)
         url = f"{BASE_URL}{DEVICES_ENDPOINT}"
+        if DEVICES_QUERY:
+            url += ("&" if "?" in url else "?") + DEVICES_QUERY
         headers = dict(DEFAULT_HEADERS)
+        # Optional extra headers (tenant/org scoping)
+        if EXTRA_HEADERS:
+            try:
+                headers.update(json.loads(EXTRA_HEADERS))
+            except Exception:
+                pass
 
         # 1) Use API key if you have one in the future
         if API_KEY:
@@ -186,7 +197,11 @@ class BoomNowHttpProvider(DeviceStatusProvider):
 
         if DEBUG_PROVIDER:
             top = list(payload.keys())[:10] if isinstance(payload, dict) else [type(payload).__name__]
+            print(f"[provider] url={url}")
             print(f"[provider] top_keys={top} items_count={len(items)}")
+            if isinstance(items, list) and items:
+                sample = list(items[0].keys())[:12] if isinstance(items[0], dict) else type(items[0]).__name__
+                print(f"[provider] sample_item_keys={sample}")
 
         out: List[Device] = []
         for item in items:
