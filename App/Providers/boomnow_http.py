@@ -1,10 +1,12 @@
 import os, re, requests
-from typing import List, Union
+from typing import List, Union, Any
 from app.device import Device
 from .base import DeviceStatusProvider
 
 BASE_URL = os.environ.get("BOOMNOW_BASE_URL", "").rstrip("/")
 DEVICES_ENDPOINT = os.environ.get("BOOMNOW_DEVICES_ENDPOINT", "/api/devices")
+DEVICES_JSON_PATH = (os.environ.get("BOOMNOW_DEVICES_JSON_PATH") or "").strip()
+DEBUG_PROVIDER = (os.environ.get("DEBUG_PROVIDER", "0") == "1")
 
 # Preferred: long-lived token if you ever get one
 API_KEY = os.environ.get("BOOMNOW_API_KEY")
@@ -28,12 +30,20 @@ def _login_session() -> requests.Session:
     if not (LOGIN_URL and EMAIL and PASSWORD):
         raise RuntimeError("Service login requested but BOOMNOW_LOGIN_URL/EMAIL/PASSWORD not set")
     s = requests.Session()
-    s.headers.update({"User-Agent": DEFAULT_HEADERS["User-Agent"]})
+    s.headers.update(DEFAULT_HEADERS)
 
     if LOGIN_KIND == "json":
         # JSON login: {"email": "...", "password": "..."}
         resp = s.post(LOGIN_URL, json={"email": EMAIL, "password": PASSWORD}, timeout=30, allow_redirects=True)
         resp.raise_for_status()
+        # Some APIs return a token instead of cookie-based auth. If present, attach it.
+        try:
+            data = resp.json()
+            token = data.get("token") or data.get("jwt") or data.get("access_token") or data.get("apiKey")
+            if token:
+                s.headers.update({"Authorization": f"Bearer {token}"})
+        except Exception:
+            pass
         return s
 
     # HTML/form login with CSRF
@@ -90,6 +100,39 @@ def _coerce_online(value: Union[str, int, float, bool, None]) -> bool:
     return bool(value)
 
 
+def _get_by_path(obj: Any, path: str):
+    if not path:
+        return None
+    cur = obj
+    for part in path.split("."):
+        if isinstance(cur, dict):
+            cur = cur.get(part)
+        else:
+            return None
+    return cur
+
+
+def _is_deviceish(d: Any) -> bool:
+    return isinstance(d, dict) and any(k in d for k in ("id", "deviceId", "uuid", "name", "deviceName", "label"))
+
+
+def _find_first_list_of_devices(o: Any):
+    # Depth-first search for the first list of dicts that look like devices.
+    if isinstance(o, list):
+        if o and all(isinstance(x, dict) for x in o) and any(_is_deviceish(x) for x in o):
+            return o
+        for x in o:
+            found = _find_first_list_of_devices(x)
+            if found is not None:
+                return found
+    elif isinstance(o, dict):
+        for v in o.values():
+            found = _find_first_list_of_devices(v)
+            if found is not None:
+                return found
+    return None
+
+
 class BoomNowHttpProvider(DeviceStatusProvider):
     def get_devices(self) -> List[Device]:
         if not BASE_URL:
@@ -116,15 +159,34 @@ class BoomNowHttpProvider(DeviceStatusProvider):
                 raise RuntimeError("401 Unauthorized: check service creds / LOGIN_KIND / LOGIN_URL") from e
             raise
 
-        payload = r.json()
+        try:
+            payload = r.json()
+        except ValueError:
+            ct = r.headers.get("content-type")
+            raise RuntimeError(f"Expected JSON but got content-type={ct}")
 
-        # Normalize payload to a list
-        if isinstance(payload, dict) and "devices" in payload:
-            items = payload["devices"]
-        elif isinstance(payload, list):
+        # Normalize payload to a list of device dicts
+        items = None
+        # 1) explicit dot-path (e.g., "data" or "data.items")
+        if DEVICES_JSON_PATH:
+            items = _get_by_path(payload, DEVICES_JSON_PATH)
+        # 2) common keys
+        if items is None and isinstance(payload, dict):
+            for k in ("devices", "data", "items", "rows", "results", "list", "entries", "records", "content"):
+                v = payload.get(k)
+                if isinstance(v, list):
+                    items = v
+                    break
+        # 3) top-level array
+        if items is None and isinstance(payload, list):
             items = payload
-        else:
-            items = payload.get("results", []) if isinstance(payload, dict) else []
+        # 4) as a last resort, recursively find the first plausible list
+        if items is None:
+            items = _find_first_list_of_devices(payload) or []
+
+        if DEBUG_PROVIDER:
+            top = list(payload.keys())[:10] if isinstance(payload, dict) else [type(payload).__name__]
+            print(f"[provider] top_keys={top} items_count={len(items)}")
 
         out: List[Device] = []
         for item in items:
@@ -138,10 +200,12 @@ class BoomNowHttpProvider(DeviceStatusProvider):
             if online_raw is None:
                 online_raw = item.get("connected")
             if online_raw is None and "status" in item:
-                # many APIs use textual status: "online"/"offline"
-                online_raw = str(item.get("status"))
+                status = item.get("status")
+                if isinstance(status, dict):
+                    online_raw = status.get("name") or status.get("text") or status.get("value") or status.get("color")
+                else:
+                    online_raw = status
             if online_raw is None:
-                # some APIs expose a color/text indicator instead
                 indicator = (
                     item.get("statusColor")
                     or item.get("status_color")
@@ -158,7 +222,7 @@ class BoomNowHttpProvider(DeviceStatusProvider):
             online = _coerce_online(online_raw)
 
             battery = None
-            for k in ("battery", "batteryPercent", "battery_percentage", "batteryLevel"):
+            for k in ("battery", "batteryPercent", "battery_percentage", "batteryLevel", "battery_level"):
                 if k in item and isinstance(item[k], (int, float)):
                     battery = int(item[k])
                     break
