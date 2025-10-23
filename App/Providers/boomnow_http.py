@@ -1,5 +1,5 @@
 import os, re, json, requests
-from typing import List, Union, Any
+from typing import List, Union, Any, Dict, Iterable
 from app.device import Device
 from .base import DeviceStatusProvider
 
@@ -115,13 +115,79 @@ def _get_by_path(obj: Any, path: str):
 
 
 def _is_deviceish(d: Any) -> bool:
-    return isinstance(d, dict) and any(k in d for k in ("id", "deviceId", "uuid", "name", "deviceName", "label"))
+    if not isinstance(d, dict):
+        return False
+
+    id_keys: Iterable[str] = (
+        "id",
+        "deviceId",
+        "device_id",
+        "deviceID",
+        "uuid",
+        "lockId",
+        "lock_id",
+        "serialNumber",
+        "serial_number",
+    )
+    name_keys: Iterable[str] = ("name", "deviceName", "label", "device")
+    status_keys: Iterable[str] = (
+        "online",
+        "isOnline",
+        "is_online",
+        "connected",
+        "status",
+        "statusText",
+        "status_text",
+        "statusColor",
+        "status_color",
+    )
+
+    has_id = any(k in d and d[k] not in (None, "") for k in id_keys)
+    has_name = any(k in d and d[k] not in (None, "") for k in name_keys)
+    has_status = any(k in d for k in status_keys)
+    return has_id or (has_name and has_status)
+
+
+def _looks_like_device_wrapper(d: Any) -> bool:
+    if _is_deviceish(d):
+        return True
+    if not isinstance(d, dict):
+        return False
+    for key in ("node", "device", "attributes", "details", "meta", "metadata", "info", "data"):
+        if key in d and isinstance(d[key], dict):
+            if _looks_like_device_wrapper(d[key]):
+                return True
+    return False
+
+
+def _unwrap_device_dict(item: Any) -> Dict[str, Any]:
+    """Flatten common GraphQL/REST wrapper shapes into a device dict."""
+
+    if not isinstance(item, dict):
+        return item
+
+    for key in ("node", "device", "attributes", "details", "meta", "metadata", "info", "data"):
+        if key in item and isinstance(item[key], dict):
+            outer = {k: v for k, v in item.items() if k != key}
+            inner = _unwrap_device_dict(item[key])
+            if isinstance(inner, dict):
+                merged = dict(inner)
+                # Preserve useful metadata (e.g., building/room) without clobbering core fields.
+                for k, v in outer.items():
+                    if k not in merged:
+                        merged[k] = v
+                return merged
+
+    if _is_deviceish(item):
+        return item
+
+    return item
 
 
 def _find_first_list_of_devices(o: Any):
     # Depth-first search for the first list of dicts that look like devices.
     if isinstance(o, list):
-        if o and all(isinstance(x, dict) for x in o) and any(_is_deviceish(x) for x in o):
+        if o and all(isinstance(x, dict) for x in o) and any(_looks_like_device_wrapper(x) for x in o):
             return o
         for x in o:
             found = _find_first_list_of_devices(x)
@@ -133,6 +199,44 @@ def _find_first_list_of_devices(o: Any):
             if found is not None:
                 return found
     return None
+
+
+def _extract_device_dicts(payload: Any) -> List[Dict[str, Any]]:
+    items = None
+    # 1) explicit dot-path (e.g., "data" or "data.items")
+    if DEVICES_JSON_PATH:
+        items = _get_by_path(payload, DEVICES_JSON_PATH)
+    # 2) common keys
+    if items is None and isinstance(payload, dict):
+        for k in ("devices", "data", "items", "rows", "results", "list", "entries", "records", "content"):
+            v = payload.get(k)
+            if isinstance(v, list):
+                items = v
+                break
+            if isinstance(v, dict) and any(isinstance(x, list) for x in v.values()):
+                # Some APIs nest the list one level deeper (e.g., {"data": {"devices": []}})
+                for vv in v.values():
+                    if isinstance(vv, list) and vv:
+                        if all(isinstance(x, dict) for x in vv) and any(_looks_like_device_wrapper(x) for x in vv):
+                            items = vv
+                            break
+                if items is not None:
+                    break
+    # 3) top-level array
+    if items is None and isinstance(payload, list):
+        items = payload
+    # 4) as a last resort, recursively find the first plausible list
+    if items is None:
+        items = _find_first_list_of_devices(payload) or []
+
+    if not isinstance(items, list):
+        return []
+
+    normalized: List[Dict[str, Any]] = []
+    for item in items:
+        if isinstance(item, dict):
+            normalized.append(_unwrap_device_dict(item))
+    return normalized
 
 
 class BoomNowHttpProvider(DeviceStatusProvider):
@@ -177,36 +281,41 @@ class BoomNowHttpProvider(DeviceStatusProvider):
             raise RuntimeError(f"Expected JSON but got content-type={ct}")
 
         # Normalize payload to a list of device dicts
-        items = None
-        # 1) explicit dot-path (e.g., "data" or "data.items")
-        if DEVICES_JSON_PATH:
-            items = _get_by_path(payload, DEVICES_JSON_PATH)
-        # 2) common keys
-        if items is None and isinstance(payload, dict):
-            for k in ("devices", "data", "items", "rows", "results", "list", "entries", "records", "content"):
-                v = payload.get(k)
-                if isinstance(v, list):
-                    items = v
-                    break
-        # 3) top-level array
-        if items is None and isinstance(payload, list):
-            items = payload
-        # 4) as a last resort, recursively find the first plausible list
-        if items is None:
-            items = _find_first_list_of_devices(payload) or []
+        items = _extract_device_dicts(payload)
 
         if DEBUG_PROVIDER:
             top = list(payload.keys())[:10] if isinstance(payload, dict) else [type(payload).__name__]
             print(f"[provider] url={url}")
             print(f"[provider] top_keys={top} items_count={len(items)}")
-            if isinstance(items, list) and items:
-                sample = list(items[0].keys())[:12] if isinstance(items[0], dict) else type(items[0]).__name__
+            if items:
+                sample = list(items[0].keys())[:12]
                 print(f"[provider] sample_item_keys={sample}")
 
         out: List[Device] = []
         for item in items:
-            did = str(item.get("id") or item.get("deviceId") or item.get("uuid") or "")
-            name = item.get("name") or item.get("label") or item.get("deviceName") or did
+            did = str(
+                item.get("id")
+                or item.get("deviceId")
+                or item.get("device_id")
+                or item.get("deviceID")
+                or item.get("uuid")
+                or item.get("lockId")
+                or item.get("lock_id")
+                or item.get("serialNumber")
+                or item.get("serial_number")
+                or ""
+            )
+            name = (
+                item.get("name")
+                or item.get("label")
+                or item.get("deviceName")
+                or item.get("device")
+                or item.get("device_label")
+                or item.get("deviceLabel")
+                or item.get("roomName")
+                or item.get("unitName")
+                or did
+            )
 
             # derive "online" from whatever the API returns
             online_raw = item.get("online")
@@ -214,6 +323,10 @@ class BoomNowHttpProvider(DeviceStatusProvider):
                 online_raw = item.get("isOnline")
             if online_raw is None:
                 online_raw = item.get("connected")
+            if online_raw is None:
+                online_raw = item.get("is_online")
+            if online_raw is None:
+                online_raw = item.get("onlineStatus")
             if online_raw is None and "status" in item:
                 status = item.get("status")
                 if isinstance(status, dict):
