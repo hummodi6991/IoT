@@ -270,10 +270,18 @@ class BoomNowHttpProvider(DeviceStatusProvider):
         if not BASE_URL:
             raise RuntimeError("BOOMNOW_BASE_URL must be set for boomnow_http provider")
 
-        # Build URL (optionally append query params)
-        url = f"{BASE_URL}{DEVICES_ENDPOINT}"
-        if DEVICES_QUERY:
-            url += ("&" if "?" in url else "?") + DEVICES_QUERY
+        # Build primary URL and a few sensible fallbacks (observed in your UI)
+        def _build(ep: str) -> str:
+            u = f"{BASE_URL}{ep}"
+            return u + (("&" if "?" in u else "?") + DEVICES_QUERY if DEVICES_QUERY else "")
+
+        candidates = [
+            _build(DEVICES_ENDPOINT),
+            _build("/api/all"),
+            _build("/api/devices"),
+            _build("/api/locks"),
+            _build("/api/iot-devices"),
+        ]
         headers = dict(DEFAULT_HEADERS)
         # Optional extra headers (tenant/org scoping)
         if EXTRA_HEADERS:
@@ -282,27 +290,38 @@ class BoomNowHttpProvider(DeviceStatusProvider):
             except Exception:
                 pass
 
-        # 1) Use API key if you have one in the future
+        session = None
         if API_KEY:
             headers["Authorization"] = f"Bearer {API_KEY}"
-            r = requests.get(url, headers=headers, timeout=30)
         else:
-            # 2) Programmatic login each run
             session = _login_session()
             headers.setdefault("Origin", BASE_URL)
             headers.setdefault("Referer", BASE_URL + "/dashboard/iot")
-            r = session.get(url, headers=headers, timeout=30)
 
-        try:
-            r.raise_for_status()
-        except requests.HTTPError as e:
-            if r.status_code == 401:
-                raise RuntimeError("401 Unauthorized: check service creds / LOGIN_KIND / LOGIN_URL") from e
-            raise
-
-        try:
-            payload = r.json()
-        except ValueError:
+        payload = None
+        items: List[Dict[str, Any]] = []
+        last_url = None
+        for url in candidates:
+            last_url = url
+            r = (requests.get(url, headers=headers, timeout=30)
+                 if API_KEY
+                 else session.get(url, headers=headers, timeout=30))
+            try:
+                r.raise_for_status()
+                payload = r.json()
+            except requests.HTTPError as e:
+                if r.status_code == 401:
+                    raise RuntimeError(
+                        "401 Unauthorized: check service creds / LOGIN_KIND / LOGIN_URL"
+                    ) from e
+                payload = None
+                continue
+            except Exception:
+                payload = None
+            items = _extract_device_dicts(payload) if payload is not None else []
+            if items:
+                break
+        if payload is None:
             ct = r.headers.get("content-type")
             raise RuntimeError(f"Expected JSON but got content-type={ct}")
 
@@ -311,7 +330,7 @@ class BoomNowHttpProvider(DeviceStatusProvider):
 
         if DEBUG_PROVIDER:
             top = list(payload.keys())[:10] if isinstance(payload, dict) else [type(payload).__name__]
-            print(f"[provider] url={url}")
+            print(f"[provider] url={last_url}")
             print(f"[provider] top_keys={top} items_count={len(items)}")
             if items:
                 sample = list(items[0].keys())[:12]
@@ -319,8 +338,7 @@ class BoomNowHttpProvider(DeviceStatusProvider):
             else:
                 try:
                     import json as _json
-                    snippet = _json.dumps(payload)[:1200]
-                    print(f"[provider] payload_snippet={snippet}")
+                    print(f"[provider] payload_snippet={_json.dumps(payload)[:1200]}")
                 except Exception:
                     pass
 
