@@ -46,11 +46,15 @@ def _login_session() -> requests.Session:
                 s.headers.update({"Authorization": f"Bearer {token}"})
         except Exception:
             pass
-        # Warm up session so server sets current team/org like the browser does.
+        # ---- Warm up the server session so it selects the default team/org ----
         try:
-            s.get((BASE_URL or "").rstrip("/") + "/dashboard/iot",
-                  headers={"Referer": (BASE_URL or "") + "/"}, timeout=20)
-            s.get((BASE_URL or "").rstrip("/") + "/api/get-current-user", timeout=20)
+            # These are harmless if they 404; they just help the server set session context.
+            s.get(f"{BASE_URL}/dashboard/iot", headers={"Referer": f"{BASE_URL}/"}, timeout=20)
+            for path in ("/api/get-current-user", "/api/teams", "/api/all"):
+                try:
+                    s.get(f"{BASE_URL}{path}", timeout=20)
+                except Exception:
+                    pass
         except Exception:
             pass
         return s
@@ -312,6 +316,13 @@ class BoomNowHttpProvider(DeviceStatusProvider):
             if items:
                 sample = list(items[0].keys())[:12]
                 print(f"[provider] sample_item_keys={sample}")
+            else:
+                try:
+                    import json as _json
+                    snippet = _json.dumps(payload)[:1200]
+                    print(f"[provider] payload_snippet={snippet}")
+                except Exception:
+                    pass
 
         out: List[Device] = []
         for item in items:
