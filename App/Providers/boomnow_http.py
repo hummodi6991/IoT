@@ -222,6 +222,14 @@ def _extract_device_dicts(payload: Any) -> List[Dict[str, Any]]:
                             break
                 if items is not None:
                     break
+        # 2b) nested "list" object with its own 'items'/'rows'/'data'
+        if items is None and isinstance(payload.get("list"), dict):
+            lst = payload["list"]
+            for k in ("items", "rows", "data", "results", "entries", "records"):
+                v = lst.get(k)
+                if isinstance(v, list):
+                    items = v
+                    break
     # 3) top-level array
     if items is None and isinstance(payload, list):
         items = payload

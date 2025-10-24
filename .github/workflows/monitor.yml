@@ -35,10 +35,10 @@ jobs:
           BOOMNOW_LOGIN_URL: ${{ vars.BOOMNOW_LOGIN_URL }}
           BOOMNOW_LOGIN_KIND: ${{ vars.BOOMNOW_LOGIN_KIND }}
           # Provider discovery / pagination / scoping
-          BOOMNOW_DEVICES_JSON_PATH: ${{ vars.BOOMNOW_DEVICES_JSON_PATH }}   # e.g. data or data.items
-          BOOMNOW_DEVICES_QUERY: ${{ vars.BOOMNOW_DEVICES_QUERY }}           # e.g. page=1&per_page=100
-          BOOMNOW_EXTRA_HEADERS: ${{ vars.BOOMNOW_EXTRA_HEADERS }}           # e.g. {"X-Org-Id":"..."}
-          DEBUG_PROVIDER: ${{ vars.DEBUG_PROVIDER }}                         # set to 1 for one run
+          BOOMNOW_DEVICES_JSON_PATH: ${{ vars.BOOMNOW_DEVICES_JSON_PATH }}   # e.g. list.items
+          BOOMNOW_DEVICES_QUERY: ${{ vars.BOOMNOW_DEVICES_QUERY }}           # e.g. perPage=100&page=1
+          BOOMNOW_EXTRA_HEADERS: ${{ vars.BOOMNOW_EXTRA_HEADERS }}           # optional org/tenant header
+          DEBUG_PROVIDER: ${{ vars.DEBUG_PROVIDER }}                         # set 1 for one run
           STRICT_EMAIL: ${{ vars.STRICT_EMAIL }}                             # optional
 
           # Secrets (credentials)
