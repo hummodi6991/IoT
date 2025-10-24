@@ -1,5 +1,5 @@
 import os, re, json, requests
-from typing import List, Union, Any, Dict, Iterable
+from typing import List, Union, Any, Dict, Iterable, Set
 from app.device import Device
 from .base import DeviceStatusProvider
 
@@ -20,6 +20,16 @@ EMAIL = os.environ.get("BOOMNOW_EMAIL")
 PASSWORD = os.environ.get("BOOMNOW_PASSWORD")
 
 DEFAULT_HEADERS = {"Accept": "application/json", "User-Agent": "iot-monitor/1.0"}
+
+
+def _json_get(sesh, url, headers, timeout=30):
+    """GET JSON with common error handling. Returns (payload, response)."""
+    r = sesh.get(url, headers=headers, timeout=timeout)
+    r.raise_for_status()
+    try:
+        return r.json(), r
+    except ValueError:
+        return None, r
 
 def _extract_csrf(html: str):
     m = re.search(r'<meta[^>]+name=["\']csrf-token["\'][^>]+content=["\']([^"\']+)["\']', html, re.I)
@@ -265,22 +275,105 @@ def _extract_device_dicts(payload: Any) -> List[Dict[str, Any]]:
     return normalized
 
 
+def _collect_ids_from_payload(p: Any) -> Dict[str, Set[str]]:
+    """Collect likely scoping identifiers (team/org/company/tenant/region/zone) from arbitrary JSON."""
+    out: Dict[str, Set[str]] = {
+        "team_ids": set(),
+        "org_ids": set(),
+        "company_ids": set(),
+        "tenant_ids": set(),
+        "region_ids": set(),
+        "zone_ids": set(),
+    }
+
+    def _add(val, bucket):
+        if val is None:
+            return
+        s = str(val).strip()
+        if s:
+            out[bucket].add(s)
+
+    def _walk(x):
+        if isinstance(x, dict):
+            for k in ("team_id", "teamId"):
+                _add(x.get(k), "team_ids")
+            for k in ("org_id", "organization_id", "organizationId"):
+                _add(x.get(k), "org_ids")
+            for k in ("company_id", "companyId"):
+                _add(x.get(k), "company_ids")
+            for k in ("tenant_id", "tenantId"):
+                _add(x.get(k), "tenant_ids")
+            for k in ("region_id", "regionId"):
+                _add(x.get(k), "region_ids")
+            for k in ("zone_id", "zoneId"):
+                _add(x.get(k), "zone_ids")
+            for container, bucket in (
+                ("teams", "team_ids"),
+                ("organizations", "org_ids"),
+                ("companies", "company_ids"),
+                ("tenants", "tenant_ids"),
+                ("regions", "region_ids"),
+                ("zones", "zone_ids"),
+            ):
+                if container in x and isinstance(x[container], list):
+                    for row in x[container]:
+                        if isinstance(row, dict):
+                            _add(row.get("id"), bucket)
+            for v in x.values():
+                _walk(v)
+        elif isinstance(x, list):
+            for v in x:
+                _walk(v)
+
+    _walk(p)
+    return out
+
+
+def _discover_scope(session: requests.Session, headers: Dict[str, str]) -> Dict[str, Set[str]]:
+    """Hit a few light endpoints to learn team/org/region/zone IDs so we can scope device queries."""
+    out: Dict[str, Set[str]] = {
+        "team_ids": set(),
+        "org_ids": set(),
+        "company_ids": set(),
+        "tenant_ids": set(),
+        "region_ids": set(),
+        "zone_ids": set(),
+    }
+
+    def _merge(found):
+        for k, v in found.items():
+            out[k].update(v)
+
+    probes = [
+        "/api/get-current-user",
+        "/api/teams",
+        "/api/config",
+        "/api/all",
+        "/api/region?include_counts=false",
+        "/api/zone?include_counts=false",
+    ]
+    for pth in probes:
+        try:
+            payload, _ = _json_get(session, f"{BASE_URL}{pth}", headers, timeout=20)
+            if payload is not None:
+                _merge(_collect_ids_from_payload(payload))
+        except Exception:
+            continue
+    return out
+
+
 class BoomNowHttpProvider(DeviceStatusProvider):
     def get_devices(self) -> List[Device]:
         if not BASE_URL:
             raise RuntimeError("BOOMNOW_BASE_URL must be set for boomnow_http provider")
 
-        # Build primary URL and a few sensible fallbacks (observed in your UI)
-        def _build(ep: str) -> str:
-            u = f"{BASE_URL}{ep}"
-            return u + (("&" if "?" in u else "?") + DEVICES_QUERY if DEVICES_QUERY else "")
-
-        candidates = [
-            _build(DEVICES_ENDPOINT),
-            _build("/api/all"),
-            _build("/api/devices"),
-            _build("/api/locks"),
-            _build("/api/iot-devices"),
+        # Build endpoint candidates
+        endpoints = [
+            DEVICES_ENDPOINT,
+            "/api/all",
+            "/api/devices",
+            "/api/locks",
+            "/api/iot-devices",
         ]
         headers = dict(DEFAULT_HEADERS)
         # Optional extra headers (tenant/org scoping)
@@ -298,38 +391,92 @@ class BoomNowHttpProvider(DeviceStatusProvider):
             headers.setdefault("Origin", BASE_URL)
             headers.setdefault("Referer", BASE_URL + "/dashboard/iot")
 
+        # Discover scope (team/org/region/zone) to try parameter variants automatically
+        scope = (
+            _discover_scope(session, headers)
+            if not API_KEY
+            else {
+                "team_ids": set(),
+                "org_ids": set(),
+                "company_ids": set(),
+                "tenant_ids": set(),
+                "region_ids": set(),
+                "zone_ids": set(),
+            }
+        )
+
+        # Build parameter variants (empty first, then scoped attempts)
+        param_variants: List[Dict[str, str]] = [{}]
+        for tid in scope["team_ids"]:
+            param_variants += [{"team_id": tid}, {"teamId": tid}]
+        for oid in scope["org_ids"]:
+            param_variants += [
+                {"org_id": oid},
+                {"organization_id": oid},
+                {"organizationId": oid},
+            ]
+        for cid in scope["company_ids"]:
+            param_variants += [{"company_id": cid}, {"companyId": cid}]
+        for ten in scope["tenant_ids"]:
+            param_variants += [{"tenant_id": ten}, {"tenantId": ten}]
+        for rid in scope["region_ids"]:
+            param_variants += [{"region_id": rid}, {"regionId": rid}]
+        for zid in scope["zone_ids"]:
+            param_variants += [{"zone_id": zid}, {"zoneId": zid}]
+
+        # Helper to assemble URL with DEVICES_QUERY and a param map
+        def _build_url(ep: str, extra_params: Dict[str, str]) -> str:
+            base = f"{BASE_URL}{ep}"
+            q = DEVICES_QUERY
+            if extra_params:
+                as_q = "&".join(f"{k}={v}" for k, v in extra_params.items())
+                q = f"{q}&{as_q}" if q else as_q
+            return base + (("?" + q) if q else "")
+
         payload = None
         items: List[Dict[str, Any]] = []
         last_url = None
-        for url in candidates:
-            last_url = url
-            r = (requests.get(url, headers=headers, timeout=30)
-                 if API_KEY
-                 else session.get(url, headers=headers, timeout=30))
-            try:
-                r.raise_for_status()
-                payload = r.json()
-            except requests.HTTPError as e:
-                if r.status_code == 401:
-                    raise RuntimeError(
-                        "401 Unauthorized: check service creds / LOGIN_KIND / LOGIN_URL"
-                    ) from e
-                payload = None
-                continue
-            except Exception:
-                payload = None
-            items = _extract_device_dicts(payload) if payload is not None else []
+        attempts: List[str] = []
+        for ep in endpoints:
+            for params in param_variants:
+                url = _build_url(ep, params)
+                last_url = url
+                attempts.append(url)
+                r = (
+                    requests.get(url, headers=headers, timeout=30)
+                    if API_KEY
+                    else session.get(url, headers=headers, timeout=30)
+                )
+                try:
+                    r.raise_for_status()
+                    payload = r.json()
+                except requests.HTTPError as e:
+                    if r.status_code == 401:
+                        raise RuntimeError(
+                            "401 Unauthorized: check service creds / LOGIN_KIND / LOGIN_URL"
+                        ) from e
+                    payload = None
+                    continue
+                except Exception:
+                    payload = None
+                    continue
+                items = _extract_device_dicts(payload) if payload is not None else []
+                if items:
+                    break
             if items:
                 break
         if payload is None:
             ct = r.headers.get("content-type")
             raise RuntimeError(f"Expected JSON but got content-type={ct}")
 
-        # Normalize payload to a list of device dicts
+        # Normalize payload to a list of device dicts (already done, but re-run for clarity)
         items = _extract_device_dicts(payload)
 
         if DEBUG_PROVIDER:
             top = list(payload.keys())[:10] if isinstance(payload, dict) else [type(payload).__name__]
+            print(f"[provider] attempts={min(len(attempts),10)} shown / {len(attempts)} total")
+            for i, u in enumerate(attempts[:10], 1):
+                print(f"[provider] try[{i}] {u}")
             print(f"[provider] url={last_url}")
             print(f"[provider] top_keys={top} items_count={len(items)}")
             if items:
