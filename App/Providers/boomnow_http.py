@@ -46,6 +46,13 @@ def _login_session() -> requests.Session:
                 s.headers.update({"Authorization": f"Bearer {token}"})
         except Exception:
             pass
+        # Warm up session so server sets current team/org like the browser does.
+        try:
+            s.get((BASE_URL or "").rstrip("/") + "/dashboard/iot",
+                  headers={"Referer": (BASE_URL or "") + "/"}, timeout=20)
+            s.get((BASE_URL or "").rstrip("/") + "/api/get-current-user", timeout=20)
+        except Exception:
+            pass
         return s
 
     # HTML/form login with CSRF
