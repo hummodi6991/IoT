@@ -1,4 +1,5 @@
 import os, re, json, requests
+from urllib.parse import urlencode
 from typing import List, Union, Any, Dict, Iterable, Set
 from app.device import Device
 from .base import DeviceStatusProvider
@@ -424,46 +425,66 @@ class BoomNowHttpProvider(DeviceStatusProvider):
         for zid in scope["zone_ids"]:
             param_variants += [{"zone_id": zid}, {"zoneId": zid}]
 
-        # Helper to assemble URL with DEVICES_QUERY and a param map
+        # Pagination / listing permutations (JSON:API & common styles)
+        paging_variants: List[Dict[str, str]] = [
+            {},  # no explicit paging
+            {"size": "100"},
+            {"page": "0", "size": "100"},
+            {"page": "1", "size": "100"},
+            {"perPage": "100"},
+            {"page[number]": "1", "page[size]": "100"},
+            {"limit": "100"},
+            {"limit": "100", "offset": "0"},
+        ]
+
+        # Helper to assemble URL with DEVICES_QUERY + a param map (properly encodes page[size])
         def _build_url(ep: str, extra_params: Dict[str, str]) -> str:
             base = f"{BASE_URL}{ep}"
-            q = DEVICES_QUERY
+            qparts = []
+            if DEVICES_QUERY:
+                qparts.append(DEVICES_QUERY)  # keep any user-supplied query as-is
             if extra_params:
-                as_q = "&".join(f"{k}={v}" for k, v in extra_params.items())
-                q = f"{q}&{as_q}" if q else as_q
+                qparts.append(urlencode(extra_params, doseq=True))
+            q = "&".join([p for p in qparts if p])
             return base + (("?" + q) if q else "")
 
         payload = None
         items: List[Dict[str, Any]] = []
         last_url = None
         attempts: List[str] = []
+        MAX_ATTEMPTS = 80  # safety cap
         for ep in endpoints:
-            for params in param_variants:
-                url = _build_url(ep, params)
-                last_url = url
-                attempts.append(url)
-                r = (
-                    requests.get(url, headers=headers, timeout=30)
-                    if API_KEY
-                    else session.get(url, headers=headers, timeout=30)
-                )
-                try:
-                    r.raise_for_status()
-                    payload = r.json()
-                except requests.HTTPError as e:
-                    if r.status_code == 401:
-                        raise RuntimeError(
-                            "401 Unauthorized: check service creds / LOGIN_KIND / LOGIN_URL"
-                        ) from e
-                    payload = None
-                    continue
-                except Exception:
-                    payload = None
-                    continue
-                items = _extract_device_dicts(payload) if payload is not None else []
-                if items:
+            for scope_params in param_variants:
+                for page_params in paging_variants:
+                    params = dict(scope_params)
+                    params.update(page_params)
+                    url = _build_url(ep, params)
+                    last_url = url
+                    attempts.append(url)
+                    r = (
+                        requests.get(url, headers=headers, timeout=30)
+                        if API_KEY
+                        else session.get(url, headers=headers, timeout=30)
+                    )
+                    try:
+                        r.raise_for_status()
+                        payload = r.json()
+                    except requests.HTTPError as e:
+                        if r.status_code == 401:
+                            raise RuntimeError(
+                                "401 Unauthorized: check service creds / LOGIN_KIND / LOGIN_URL"
+                            ) from e
+                        payload = None
+                        continue
+                    except Exception:
+                        payload = None
+                        continue
+                    items = _extract_device_dicts(payload) if payload is not None else []
+                    if items:
+                        break
+                if items or len(attempts) >= MAX_ATTEMPTS:
                     break
-            if items:
+            if items or len(attempts) >= MAX_ATTEMPTS:
                 break
         if payload is None:
             ct = r.headers.get("content-type")
