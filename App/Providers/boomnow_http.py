@@ -1,5 +1,8 @@
 import os, re, json, requests
 from typing import List, Union, Any, Dict, Iterable, Optional
+
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from app.device import Device
 from .base import DeviceStatusProvider
 
@@ -20,7 +23,13 @@ EMAIL = os.environ.get("BOOMNOW_EMAIL")
 PASSWORD = os.environ.get("BOOMNOW_PASSWORD")
 
 DEFAULT_HEADERS = {"Accept": "application/json", "User-Agent": "iot-monitor/1.0"}
-HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT_SECONDS", "8"))
+HTTP_TIMEOUT = max(1, min(int(os.environ.get("HTTP_TIMEOUT_SECONDS", "8")), 6))
+CONNECT_TIMEOUT = min(HTTP_TIMEOUT, 4)
+MAX_CANDIDATE_ATTEMPTS = max(1, int(os.environ.get("BOOMNOW_MAX_ATTEMPTS", "3")))
+
+
+def _timeout() -> tuple:
+    return (CONNECT_TIMEOUT, HTTP_TIMEOUT)
 
 
 def _safe_json(resp: requests.Response) -> Optional[Any]:
@@ -43,12 +52,22 @@ def _login_session() -> requests.Session:
     s = requests.Session()
     s.headers.update(DEFAULT_HEADERS)
 
+    retry = Retry(total=2, backoff_factor=0.3, status_forcelist=(500, 502, 503, 504))
+    for attr in ("allowed_methods", "method_whitelist"):
+        if hasattr(retry, attr):
+            setattr(retry, attr, False)
+            break
+
+    adapter = HTTPAdapter(max_retries=retry)
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+
     if LOGIN_KIND == "json":
         # JSON login: {"email": "...", "password": "..."}
         resp = s.post(
             LOGIN_URL,
             json={"email": EMAIL, "password": PASSWORD},
-            timeout=HTTP_TIMEOUT,
+            timeout=_timeout(),
             allow_redirects=True,
         )
         resp.raise_for_status()
@@ -66,7 +85,7 @@ def _login_session() -> requests.Session:
             s.get(
                 f"{BASE_URL}/dashboard/iot",
                 headers={"Referer": f"{BASE_URL}/"},
-                timeout=HTTP_TIMEOUT,
+                timeout=_timeout(),
             )
             for path in (
                 "/api/get-current-user",
@@ -77,7 +96,7 @@ def _login_session() -> requests.Session:
                 "/api/zone?include_counts=false",
             ):
                 try:
-                    s.get(f"{BASE_URL}{path}", timeout=HTTP_TIMEOUT)
+                    s.get(f"{BASE_URL}{path}", timeout=_timeout())
                 except Exception:
                     pass
         except Exception:
@@ -85,7 +104,7 @@ def _login_session() -> requests.Session:
         return s
 
     # HTML/form login with CSRF
-    getp = s.get(LOGIN_URL, timeout=HTTP_TIMEOUT)
+    getp = s.get(LOGIN_URL, timeout=_timeout())
     getp.raise_for_status()
     csrf = _extract_csrf(getp.text)
 
@@ -102,7 +121,7 @@ def _login_session() -> requests.Session:
         LOGIN_URL,
         data=form,
         headers=headers,
-        timeout=HTTP_TIMEOUT,
+        timeout=_timeout(),
         allow_redirects=True,
     )
     postp.raise_for_status()
@@ -115,9 +134,9 @@ def _discover_scope_headers(s: requests.Session) -> Dict[str, str]:
     hdrs: Dict[str, str] = {"X-Requested-With": "XMLHttpRequest"}
 
     try:
-        cu = s.get(f"{BASE_URL}/api/get-current-user", timeout=HTTP_TIMEOUT)
+        cu = s.get(f"{BASE_URL}/api/get-current-user", timeout=_timeout())
         cuj = _safe_json(cu) or {}
-        teams = s.get(f"{BASE_URL}/api/teams", timeout=HTTP_TIMEOUT)
+        teams = s.get(f"{BASE_URL}/api/teams", timeout=_timeout())
         tjson = _safe_json(teams) or {}
 
         ids: List[str] = []
@@ -387,11 +406,15 @@ class BoomNowHttpProvider(DeviceStatusProvider):
         last_url: Optional[str] = None
         response: Optional[requests.Response] = None
 
+        attempts = 0
         for url in candidates:
+            if attempts >= MAX_CANDIDATE_ATTEMPTS:
+                break
+            attempts += 1
             last_url = url
             try:
                 assert session is not None
-                response = session.get(url, headers=headers, timeout=HTTP_TIMEOUT)
+                response = session.get(url, headers=headers, timeout=_timeout())
             except requests.RequestException:
                 payload = None
                 continue
