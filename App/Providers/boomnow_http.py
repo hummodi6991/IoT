@@ -1,6 +1,6 @@
 import os, re, json, requests
 from urllib.parse import urlencode
-from typing import List, Union, Any, Dict, Iterable, Set
+from typing import List, Union, Any, Dict, Iterable, Set, Optional
 from app.device import Device
 from .base import DeviceStatusProvider
 
@@ -45,7 +45,7 @@ def _robust_json(resp):
             return None
 
 
-def _json_get(sesh, url, headers, timeout=30):
+def _json_get(sesh: requests.Session, url: str, headers: Dict[str, str], timeout: int = 30):
     """GET JSON with common error handling. Returns (payload, response)."""
     r = sesh.get(url, headers=headers, timeout=timeout)
     r.raise_for_status()
@@ -385,6 +385,31 @@ def _discover_scope(session: requests.Session, headers: Dict[str, str]) -> Dict[
     return out
 
 
+def _apply_scope_headers(headers: Dict[str, str], scope: Dict[str, Set[str]], session: Optional[requests.Session] = None) -> None:
+    """Populate common scoping headers (X-Org-Id, etc.) using discovered identifiers."""
+
+    header_map = {
+        "team_ids": ["X-Team-Id", "X-Team-ID"],
+        "org_ids": ["X-Org-Id", "X-Org-ID", "X-Organization-Id"],
+        "company_ids": ["X-Company-Id", "X-Company-ID"],
+        "tenant_ids": ["X-Tenant-Id", "X-Tenant-ID"],
+        "region_ids": ["X-Region-Id", "X-Region-ID"],
+        "zone_ids": ["X-Zone-Id", "X-Zone-ID"],
+    }
+
+    for bucket, header_names in header_map.items():
+        values = list(scope.get(bucket) or [])
+        if not values:
+            continue
+        value = values[0]
+        for header_name in header_names:
+            if header_name not in headers:
+                headers[header_name] = value
+                if session is not None:
+                    session.headers.setdefault(header_name, value)
+                break
+
+
 class BoomNowHttpProvider(DeviceStatusProvider):
     def get_devices(self) -> List[Device]:
         if not BASE_URL:
@@ -406,27 +431,22 @@ class BoomNowHttpProvider(DeviceStatusProvider):
             except Exception:
                 pass
 
-        session = None
         if API_KEY:
+            session = requests.Session()
+            session.headers.update(headers)
+            session.headers["Authorization"] = f"Bearer {API_KEY}"
             headers["Authorization"] = f"Bearer {API_KEY}"
         else:
             session = _login_session()
+            session.headers.update(headers)
             headers.setdefault("Origin", BASE_URL)
             headers.setdefault("Referer", BASE_URL + "/dashboard/iot")
+            session.headers.setdefault("Origin", headers["Origin"])
+            session.headers.setdefault("Referer", headers["Referer"])
 
         # Discover scope (team/org/region/zone) to try parameter variants automatically
-        scope = (
-            _discover_scope(session, headers)
-            if not API_KEY
-            else {
-                "team_ids": set(),
-                "org_ids": set(),
-                "company_ids": set(),
-                "tenant_ids": set(),
-                "region_ids": set(),
-                "zone_ids": set(),
-            }
-        )
+        scope = _discover_scope(session, headers)
+        _apply_scope_headers(headers, scope, session=session)
 
         # Build parameter variants (empty first, then scoped attempts)
         param_variants: List[Dict[str, str]] = [{}]
@@ -483,11 +503,7 @@ class BoomNowHttpProvider(DeviceStatusProvider):
                     url = _build_url(ep, params)
                     last_url = url
                     attempts.append(url)
-                    r = (
-                        requests.get(url, headers=headers, timeout=30)
-                        if API_KEY
-                        else session.get(url, headers=headers, timeout=30)
-                    )
+                    r = session.get(url, headers=headers, timeout=30)
                     try:
                         r.raise_for_status()
                         payload = _robust_json(r)

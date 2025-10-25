@@ -5,12 +5,13 @@
 - Fill environment variables:
   - BOOMNOW_BASE_URL
   - BOOMNOW_DEVICES_ENDPOINT (e.g., `/api/devices`)
-  - One of: BOOMNOW_API_KEY or (BOOMNOW_USERNAME + BOOMNOW_PASSWORD)
+- One of: BOOMNOW_API_KEY or (BOOMNOW_USERNAME + BOOMNOW_PASSWORD)
 - Ensure `providers/boomnow_http.py:get_devices()` returns a list of dicts like:
   ```python
   {"id": "abc123", "name": "Apartment 10", "online": True, "battery": 91}
   ```
 - Map platform-specific JSON fields to the normalized keys above.
+- The provider will probe BoomNow endpoints automatically (including pagination and team/org scoping headers). If your payload nests devices unusually, set `BOOMNOW_DEVICES_JSON_PATH` to a dot path such as `list.content`.
 
 **Acceptance**: `pytest -q` passes; pushing to main triggers the workflow; if you temporarily set a device to `online: false` in the demo JSON (or mock HTTP), email fires once and then again only after cooldown; recovery email fires when back to `true`.
 
