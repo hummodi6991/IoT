@@ -1,8 +1,5 @@
-import os, re, json, requests
+import os, re, json, time, requests
 from typing import List, Union, Any, Dict, Iterable, Optional
-
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 from app.device import Device
 from .base import DeviceStatusProvider
 
@@ -13,68 +10,19 @@ DEBUG_PROVIDER = (os.environ.get("DEBUG_PROVIDER", "0") == "1")
 DEVICES_QUERY = (os.environ.get("BOOMNOW_DEVICES_QUERY") or "").lstrip("?")
 EXTRA_HEADERS = os.environ.get("BOOMNOW_EXTRA_HEADERS")  # JSON dict, optional
 
-# Preferred: long-lived token if you ever get one
 API_KEY = os.environ.get("BOOMNOW_API_KEY")
 
-# Programmatic sign-in (service account)
 LOGIN_URL = os.environ.get("BOOMNOW_LOGIN_URL")
 LOGIN_KIND = (os.environ.get("BOOMNOW_LOGIN_KIND") or "form").lower()  # "json" or "form"
 EMAIL = os.environ.get("BOOMNOW_EMAIL")
 PASSWORD = os.environ.get("BOOMNOW_PASSWORD")
 
 DEFAULT_HEADERS = {"Accept": "application/json", "User-Agent": "iot-monitor/1.0"}
-JSON_CT_HINTS = ("application/json", "text/json", "application/problem+json")
-REQ_TIMEOUT = float(
-    os.environ.get(
-        "BOOMNOW_TIMEOUT_SECONDS",
-        os.environ.get("HTTP_TIMEOUT_SECONDS", "12"),
-    )
-)
-HTTP_TIMEOUT = max(1.0, min(REQ_TIMEOUT, 15.0))
-CONNECT_TIMEOUT = min(HTTP_TIMEOUT, 4.0)
-MAX_TRIES = max(
-    1,
-    int(
-        os.environ.get(
-            "BOOMNOW_MAX_TRIES",
-            os.environ.get("BOOMNOW_MAX_ATTEMPTS", "3"),
-        )
-    ),
-)
 
 
-def _timeout() -> tuple:
-    return (CONNECT_TIMEOUT, HTTP_TIMEOUT)
-
-
-def _safe_json(resp: requests.Response) -> Optional[Any]:
-    """Best-effort JSON loader tolerant of flaky content types and HTML errors."""
-
-    try:
-        ct = resp.headers.get("content-type", "").lower()
-    except Exception:
-        ct = ""
-
-    try:
-        if any(hint in ct for hint in JSON_CT_HINTS):
-            return resp.json()
-    except Exception:
-        pass
-
-    try:
-        return resp.json()
-    except Exception:
-        try:
-            text = resp.text or ""
-        except Exception:
-            text = ""
-        snippet = text.lstrip()
-        if snippet.startswith("{") or snippet.startswith("["):
-            try:
-                return json.loads(snippet)
-            except Exception:
-                return None
-        return None
+def _d(msg: str):
+    if DEBUG_PROVIDER:
+        print(f"[provider] {time.strftime('%H:%M:%S')} {msg}", flush=True)
 
 
 def _extract_csrf(html: str):
@@ -84,172 +32,67 @@ def _extract_csrf(html: str):
     m = re.search(r'name=["\']authenticity_token["\'][^>]*value=["\']([^"\']+)["\']', html, re.I)
     return m.group(1) if m else None
 
+
 def _login_session() -> requests.Session:
     if not (LOGIN_URL and EMAIL and PASSWORD):
         raise RuntimeError("Service login requested but BOOMNOW_LOGIN_URL/EMAIL/PASSWORD not set")
     s = requests.Session()
     s.headers.update(DEFAULT_HEADERS)
-
-    retry = Retry(total=2, backoff_factor=0.3, status_forcelist=(500, 502, 503, 504))
-    for attr in ("allowed_methods", "method_whitelist"):
-        if hasattr(retry, attr):
-            setattr(retry, attr, False)
-            break
-
-    adapter = HTTPAdapter(max_retries=retry)
-    s.mount("http://", adapter)
-    s.mount("https://", adapter)
+    t0 = time.time()
 
     if LOGIN_KIND == "json":
-        # JSON login: {"email": "...", "password": "..."}
-        resp = s.post(
-            LOGIN_URL,
-            json={"email": EMAIL, "password": PASSWORD},
-            timeout=_timeout(),
-            allow_redirects=True,
-        )
+        _d(f"login(kind=json) POST {LOGIN_URL}")
+        resp = s.post(LOGIN_URL, json={"email": EMAIL, "password": PASSWORD}, timeout=20, allow_redirects=True)
         resp.raise_for_status()
-        # Some APIs return a token instead of cookie-based auth. If present, attach it.
         try:
             data = resp.json()
             token = data.get("token") or data.get("jwt") or data.get("access_token") or data.get("apiKey")
             if token:
                 s.headers.update({"Authorization": f"Bearer {token}"})
+                _d("login: bearer token attached")
         except Exception:
             pass
-        # ---- Warm up the server session so it selects the default team/org ----
-        try:
-            # These are harmless if they 404; they just help the server set session context.
-            s.get(
-                f"{BASE_URL}/dashboard/iot",
-                headers={"Referer": f"{BASE_URL}/"},
-                timeout=_timeout(),
-            )
-            for path in (
-                "/api/get-current-user",
-                "/api/teams",
-                "/api/config",
-                "/api/all",
-                "/api/region?include_counts=false",
-                "/api/zone?include_counts=false",
-            ):
-                try:
-                    s.get(f"{BASE_URL}{path}", timeout=_timeout())
-                except Exception:
-                    pass
-        except Exception:
-            pass
+        _d(f"login(kind=json) done in {time.time()-t0:.2f}s")
         return s
 
-    # HTML/form login with CSRF
-    getp = s.get(LOGIN_URL, timeout=_timeout())
+    _d(f"login(kind=form) GET {LOGIN_URL}")
+    getp = s.get(LOGIN_URL, timeout=20)
     getp.raise_for_status()
     csrf = _extract_csrf(getp.text)
-
-    # Default fields
     form = {"email": EMAIL, "password": PASSWORD}
-    # Support Rails-style nested fields if present
     if re.search(r'name=["\']user\[email\]["\']', getp.text, re.I):
         form = {"user[email]": EMAIL, "user[password]": PASSWORD}
     if csrf:
         form["authenticity_token"] = csrf
-
     headers = {"Referer": LOGIN_URL, "Origin": BASE_URL or LOGIN_URL.split("/api")[0]}
-    postp = s.post(
-        LOGIN_URL,
-        data=form,
-        headers=headers,
-        timeout=_timeout(),
-        allow_redirects=True,
-    )
+    _d(f"login(kind=form) POST {LOGIN_URL}")
+    postp = s.post(LOGIN_URL, data=form, headers=headers, timeout=20, allow_redirects=True)
     postp.raise_for_status()
+    _d(f"login(kind=form) done in {time.time()-t0:.2f}s")
     return s
 
 
-def _discover_scope_headers(s: requests.Session) -> Dict[str, str]:
-    """Query lightweight endpoints and return likely scoping headers."""
-
-    headers: Dict[str, str] = {"X-Requested-With": "XMLHttpRequest"}
-    scope_id: Optional[str] = None
-
-    for url in (
-        "/api/teams?include_counts=false",
-        "/api/get-current-user",
-        "/api/teams",
-    ):
-        try:
-            resp = s.get(f"{BASE_URL}{url}", timeout=_timeout())
-        except Exception:
-            continue
-
-        data = _safe_json(resp) or {}
-
-        if isinstance(data, dict) and isinstance(data.get("teams"), list) and data["teams"]:
-            candidate = data["teams"][0].get("id")
-            if candidate:
-                scope_id = str(candidate)
-                break
-
-        for key in ("user", "currentUser"):
-            user = data.get(key) if isinstance(data, dict) else None
-            if not isinstance(user, dict):
-                continue
-            teams = user.get("teams") or user.get("orgs") or []
-            if isinstance(teams, list) and teams:
-                team = teams[0]
-                if isinstance(team, dict):
-                    candidate = team.get("id") or team.get("team_id") or team.get("org_id")
-                    if candidate:
-                        scope_id = str(candidate)
-                        break
-        if scope_id:
+def _safe_json(resp) -> Any:
+    """
+    Robust JSON loader that tolerates BOM, anti-XSSI prefixes, and HTML error pages.
+    """
+    ct = resp.headers.get("content-type", "")
+    txt = resp.text or ""
+    raw = txt.lstrip("\ufeff").lstrip()
+    for p in (")]}',\n", "while(1);", "for(;;);"):
+        if raw.startswith(p):
+            raw = raw[len(p):].lstrip()
             break
-
-    if scope_id:
-        headers.update(
-            {
-                "X-Team-Id": scope_id,
-                "X-Company-Id": scope_id,
-                "X-Org-Id": scope_id,
-            }
-        )
-
-    return headers
-
-def _coerce_online(value: Union[str, int, float, bool, None]) -> bool:
-    # Accept real booleans and 0/1 first
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return value != 0
-
-    # Handle common status strings
-    if isinstance(value, str):
-        v = value.strip().lower()
-        if v in {"true", "1", "yes", "online", "up", "connected", "active", "alive"}:
-            return True
-        if v in {
-            "false",
-            "0",
-            "no",
-            "offline",
-            "down",
-            "inactive",
-            "disconnected",
-            "no data",
-            "unknown",
-            "n/a",
-            "na",
-            "not available",
-            "none",
-            "null",
-            "—",
-            "-",
-        }:
-            return False
-
-    # Fallback – truthiness
-    return bool(value)
+    if raw[:10].lower().startswith("<!doctype") or raw[:5].lower().startswith("<html"):
+        raise RuntimeError(f"Expected JSON but got HTML; ct={ct}; snippet={raw[:140]!r}")
+    first = [i for i in (raw.find("{"), raw.find("[")) if i >= 0]
+    if first:
+        start = min(first)
+        raw = raw[start:]
+    try:
+        return json.loads(raw)
+    except Exception as ex:
+        raise RuntimeError(f"Expected JSON but could not decode; ct={ct}; snippet={raw[:220]!r}") from ex
 
 
 def _get_by_path(obj: Any, path: str):
@@ -264,45 +107,12 @@ def _get_by_path(obj: Any, path: str):
     return cur
 
 
-def _is_deviceish(d: Any) -> bool:
-    if not isinstance(d, dict):
-        return False
-
-    id_keys: Iterable[str] = (
-        "id",
-        "deviceId",
-        "device_id",
-        "deviceID",
-        "uuid",
-        "lockId",
-        "lock_id",
-        "serialNumber",
-        "serial_number",
-    )
-    name_keys: Iterable[str] = ("name", "deviceName", "label", "device")
-    status_keys: Iterable[str] = (
-        "online",
-        "isOnline",
-        "is_online",
-        "connected",
-        "status",
-        "statusText",
-        "status_text",
-        "statusColor",
-        "status_color",
-    )
-
-    has_id = any(k in d and d[k] not in (None, "") for k in id_keys)
-    has_name = any(k in d and d[k] not in (None, "") for k in name_keys)
-    has_status = any(k in d for k in status_keys)
-    return has_id or (has_name and has_status)
-
-
 def _looks_like_device_wrapper(d: Any) -> bool:
-    if _is_deviceish(d):
-        return True
     if not isinstance(d, dict):
         return False
+    for k in ("id", "deviceId", "device_id", "uuid", "lockId", "serialNumber", "name", "deviceName", "status", "online"):
+        if k in d:
+            return True
     for key in ("node", "device", "attributes", "details", "meta", "metadata", "info", "data"):
         if key in d and isinstance(d[key], dict):
             if _looks_like_device_wrapper(d[key]):
@@ -311,31 +121,22 @@ def _looks_like_device_wrapper(d: Any) -> bool:
 
 
 def _unwrap_device_dict(item: Any) -> Dict[str, Any]:
-    """Flatten common GraphQL/REST wrapper shapes into a device dict."""
-
     if not isinstance(item, dict):
         return item
-
     for key in ("node", "device", "attributes", "details", "meta", "metadata", "info", "data"):
         if key in item and isinstance(item[key], dict):
             outer = {k: v for k, v in item.items() if k != key}
             inner = _unwrap_device_dict(item[key])
             if isinstance(inner, dict):
                 merged = dict(inner)
-                # Preserve useful metadata (e.g., building/room) without clobbering core fields.
                 for k, v in outer.items():
                     if k not in merged:
                         merged[k] = v
                 return merged
-
-    if _is_deviceish(item):
-        return item
-
     return item
 
 
 def _find_first_list_of_devices(o: Any):
-    # Depth-first search for the first list of dicts that look like devices.
     if isinstance(o, list):
         if o and all(isinstance(x, dict) for x in o) and any(_looks_like_device_wrapper(x) for x in o):
             return o
@@ -353,10 +154,8 @@ def _find_first_list_of_devices(o: Any):
 
 def _extract_device_dicts(payload: Any) -> List[Dict[str, Any]]:
     items = None
-    # 1) explicit dot-path (e.g., "data" or "data.items")
     if DEVICES_JSON_PATH:
         items = _get_by_path(payload, DEVICES_JSON_PATH)
-    # 2) common keys
     if items is None and isinstance(payload, dict):
         for k in ("devices", "data", "items", "rows", "results", "list", "entries", "records", "content"):
             v = payload.get(k)
@@ -364,44 +163,84 @@ def _extract_device_dicts(payload: Any) -> List[Dict[str, Any]]:
                 items = v
                 break
             if isinstance(v, dict) and any(isinstance(x, list) for x in v.values()):
-                # Some APIs nest the list one level deeper (e.g., {"data": {"devices": []}})
                 for vv in v.values():
-                    if isinstance(vv, list) and vv:
-                        if all(isinstance(x, dict) for x in vv) and any(_looks_like_device_wrapper(x) for x in vv):
-                            items = vv
-                            break
+                    if isinstance(vv, list) and vv and all(isinstance(x, dict) for x in vv):
+                        items = vv
+                        break
                 if items is not None:
                     break
-        # 2b) nested "list" object with its own 'items'/'rows'/'data'
         if items is None and isinstance(payload.get("list"), dict):
             lst = payload["list"]
-            # Common subkeys, including Spring-style "content"
             for k in ("items", "rows", "data", "results", "entries", "records", "content"):
                 v = lst.get(k)
                 if isinstance(v, list):
                     items = v
                     break
-            # Ultimate fallback: first list of dicts under "list"
-            if items is None:
-                for v in lst.values():
-                    if isinstance(v, list) and v and all(isinstance(x, dict) for x in v):
-                        items = v
-                        break
-    # 3) top-level array
     if items is None and isinstance(payload, list):
         items = payload
-    # 4) as a last resort, recursively find the first plausible list
     if items is None:
         items = _find_first_list_of_devices(payload) or []
-
     if not isinstance(items, list):
         return []
-
     normalized: List[Dict[str, Any]] = []
-    for item in items:
-        if isinstance(item, dict):
-            normalized.append(_unwrap_device_dict(item))
+    for it in items:
+        if isinstance(it, dict):
+            normalized.append(_unwrap_device_dict(it))
     return normalized
+
+
+def _coerce_online(value: Union[str, int, float, bool, None]) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in {"true", "1", "yes", "online", "up", "connected", "active", "alive"}:
+            return True
+        if v in {"false", "0", "no", "offline", "down", "inactive", "disconnected", "no data", "unknown", "n/a", "na", "not available", "none", "null", "—", "-"}:
+            return False
+    return bool(value)
+
+
+def _discover_scope_ids(session: requests.Session) -> List[str]:
+    out: List[str] = []
+    for ep in ("/api/get-current-user", "/api/teams", "/api/all"):
+        try:
+            url = f"{BASE_URL}{ep}"
+            _d(f"discover GET {url}")
+            r = session.get(url, timeout=8)
+            if r.status_code >= 400:
+                continue
+            data = _safe_json(r)
+
+            def harvest(obj):
+                if isinstance(obj, dict):
+                    for k, v in obj.items():
+                        lk = k.lower()
+                        if any(s in lk for s in ("team", "tenant", "org", "company", "account")) and isinstance(v, (str, int)):
+                            s = str(v)
+                            if s and s not in out:
+                                out.append(s)
+                        harvest(v)
+                elif isinstance(obj, list):
+                    for x in obj:
+                        harvest(x)
+
+            harvest(data)
+        except Exception:
+            continue
+    return out[:5]
+
+
+def _scope_header_variants(scope_ids: List[str]) -> List[Dict[str, str]]:
+    variants: List[Dict[str, str]] = []
+    base_candidates = ("X-Team-Id", "X-Team-ID", "X-Org-Id", "X-Company-Id", "X-Tenant-Id")
+    for sid in scope_ids or [""]:
+        for h in base_candidates:
+            variants.append({h: sid, "X-Requested-With": "XMLHttpRequest"})
+    variants.append({"X-Requested-With": "XMLHttpRequest"})
+    return variants
 
 
 class BoomNowHttpProvider(DeviceStatusProvider):
@@ -409,106 +248,96 @@ class BoomNowHttpProvider(DeviceStatusProvider):
         if not BASE_URL:
             raise RuntimeError("BOOMNOW_BASE_URL must be set for boomnow_http provider")
 
-        query = DEVICES_QUERY or "size=100"
+        def _build(ep: str, q: str) -> str:
+            u = f"{BASE_URL}{ep}"
+            if DEVICES_QUERY:
+                u += ("&" if "?" in u else "?") + DEVICES_QUERY
+            if q:
+                u += ("&" if "?" in u else "?") + q
+            return u
 
-        def _build(ep: str) -> str:
-            url = f"{BASE_URL}{ep}"
-            if query:
-                sep = "&" if "?" in url else "?"
-                url = f"{url}{sep}{query}"
-            return url
-
-        candidates = [
-            _build(DEVICES_ENDPOINT),
-            _build("/api/all"),
-            _build("/api/devices"),
-            _build("/api/locks"),
-            _build("/api/iot-devices"),
-        ]
+        endpoints = [DEVICES_ENDPOINT, "/api/iot-devices", "/api/devices", "/api/locks"]
+        page_params = ["", "size=100", "page=1&size=100", "perPage=100", "limit=100", "limit=100&offset=0"]
 
         headers = dict(DEFAULT_HEADERS)
-        headers.setdefault("X-Requested-With", "XMLHttpRequest")
         if EXTRA_HEADERS:
             try:
                 headers.update(json.loads(EXTRA_HEADERS))
             except Exception:
                 pass
 
-        session: Optional[requests.Session] = None
         if API_KEY:
             headers["Authorization"] = f"Bearer {API_KEY}"
             session = requests.Session()
-            session.headers.update(headers)
-            headers.update(_discover_scope_headers(session))
         else:
             session = _login_session()
             headers.setdefault("Origin", BASE_URL)
             headers.setdefault("Referer", BASE_URL + "/dashboard/iot")
-            headers.update(_discover_scope_headers(session))
 
-        payload: Optional[Any] = None
+        scope_ids = _discover_scope_ids(session) if not API_KEY else []
+        header_variants = _scope_header_variants(scope_ids)
+        header_variants.insert(0, {k: v for k, v in headers.items() if k.lower().startswith("x-")})
+
+        attempts: List[str] = []
+        SAFETY_CAP = 30
         items: List[Dict[str, Any]] = []
-        last_url: Optional[str] = None
-        response: Optional[requests.Response] = None
+        payload: Optional[Any] = None
+        last_url = None
+        attempt_idx = 0
 
-        tries = 0
-        idx = 0
-        while idx < len(candidates) and tries < MAX_TRIES:
-            url = candidates[idx]
-            idx += 1
-            tries += 1
-            last_url = url
+        for ep in endpoints:
+            for qp in page_params:
+                for hv in header_variants:
+                    attempt_idx += 1
+                    if attempt_idx > SAFETY_CAP:
+                        break
+                    req_headers = dict(headers)
+                    req_headers.update({k: v for k, v in hv.items() if v})
+                    url = _build(ep, qp)
+                    last_url = url
+                    try:
+                        t0 = time.time()
+                        r = session.get(url, headers=req_headers, timeout=10, allow_redirects=True)
+                        ct = r.headers.get("content-type", "")
+                        body_len = int(r.headers.get("content-length", "0") or 0) or len(r.content or b"")
+                        _d(f"try[{attempt_idx}] {url} -> {r.status_code} ct={ct} bytes={body_len}")
+                        if r.status_code >= 500:
+                            try:
+                                _d(f"server500 snippet={r.text[:140]!r}")
+                            except Exception:
+                                pass
+                            continue
+                        r.raise_for_status()
+                        payload = _safe_json(r)
+                    except Exception as ex:
+                        _d(f"try[{attempt_idx}] decode error: {ex}")
+                        continue
 
-            try:
-                assert session is not None
-                response = session.get(url, headers=headers, timeout=_timeout())
-            except requests.RequestException:
-                payload = None
-                continue
-
-            try:
-                response.raise_for_status()
-            except requests.HTTPError as exc:
-                if response.status_code == 401:
-                    raise RuntimeError(
-                        "401 Unauthorized: check service creds / LOGIN_KIND / LOGIN_URL"
-                    ) from exc
-                payload = None
-                continue
-
-            payload = _safe_json(response)
-            if payload is None:
-                continue
-
-            items = _extract_device_dicts(payload)
+                    items = _extract_device_dicts(payload)
+                    if items:
+                        _d(f"items_count={len(items)} (success on {url})")
+                        break
+                if items:
+                    break
             if items:
                 break
 
-            if (
-                "X-Team-Id" in headers
-                and "tenantId" not in url
-                and tries < MAX_TRIES
-            ):
-                sep = "&" if "?" in url else "?"
-                scoped_url = f"{url}{sep}tenantId={headers['X-Team-Id']}"
-                if scoped_url not in candidates:
-                    candidates.append(scoped_url)
-
         if payload is None:
-            ct = response.headers.get("content-type") if response is not None else None
+            ct = "(none)"
+            if 'r' in locals():
+                ct = r.headers.get("content-type", "")
             raise RuntimeError(f"Expected JSON but got content-type={ct}")
 
         if DEBUG_PROVIDER:
             top = list(payload.keys())[:10] if isinstance(payload, dict) else [type(payload).__name__]
-            print(f"[provider] url={last_url}")
-            print(f"[provider] top_keys={top} items_count={len(items)}")
+            _d(f"url={last_url}")
+            _d(f"top_keys={top} items_count={len(items)}")
             if items:
-                sample = list(items[0].keys())[:12]
-                print(f"[provider] sample_item_keys={sample}")
+                _d(f"sample_item_keys={list(items[0].keys())[:12]}")
             else:
                 try:
                     import json as _json
-                    print(f"[provider] payload_snippet={_json.dumps(payload)[:1200]}")
+                    _d(f"payload_snippet={_json.dumps(payload)[:1200]}")
                 except Exception:
                     pass
 
@@ -537,17 +366,13 @@ class BoomNowHttpProvider(DeviceStatusProvider):
                 or item.get("unitName")
                 or did
             )
-
-            # derive "online" from whatever the API returns
-            online_raw = item.get("online")
-            if online_raw is None:
-                online_raw = item.get("isOnline")
-            if online_raw is None:
-                online_raw = item.get("connected")
-            if online_raw is None:
-                online_raw = item.get("is_online")
-            if online_raw is None:
-                online_raw = item.get("onlineStatus")
+            online_raw = (
+                item.get("online")
+                or item.get("isOnline")
+                or item.get("connected")
+                or item.get("is_online")
+                or item.get("onlineStatus")
+            )
             if online_raw is None and "status" in item:
                 status = item.get("status")
                 if isinstance(status, dict):
