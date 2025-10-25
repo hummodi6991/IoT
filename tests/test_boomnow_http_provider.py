@@ -24,19 +24,6 @@ def reset_globals(monkeypatch):
     monkeypatch.setattr(boomnow_http, "LOGIN_KIND", "form", raising=False)
     monkeypatch.setattr(boomnow_http, "EMAIL", None, raising=False)
     monkeypatch.setattr(boomnow_http, "PASSWORD", None, raising=False)
-    monkeypatch.setattr(
-        boomnow_http,
-        "_discover_scope",
-        lambda session, headers: {
-            "team_ids": set(),
-            "org_ids": set(),
-            "company_ids": set(),
-            "tenant_ids": set(),
-            "region_ids": set(),
-            "zone_ids": set(),
-        },
-        raising=False,
-    )
     yield
 
 
@@ -196,7 +183,7 @@ def test_provider_returns_devices_from_wrapped_payload(monkeypatch):
             return self._data
 
     def fake_get(self, url, headers=None, timeout=None):
-        if url.endswith("/api/devices"):
+        if url.split("?")[0].endswith("/api/devices"):
             assert headers["Authorization"].startswith("Bearer ")
             return DummyResponse(payload)
         return DummyResponse({})
@@ -249,7 +236,7 @@ def test_provider_interprets_string_and_indicator_status(monkeypatch):
             return self._data
 
     def fake_get(self, url, headers=None, timeout=None):
-        if url.endswith("/api/devices"):
+        if url.split("?")[0].endswith("/api/devices"):
             return DummyResponse(payload)
         return DummyResponse({})
 
@@ -268,18 +255,15 @@ def test_provider_interprets_string_and_indicator_status(monkeypatch):
     assert second.battery == 90
 
 
-def test_provider_attempts_scope_header_variants(monkeypatch):
-    # Override scope discovery to return multiple IDs so header variants are tried.
+def test_provider_applies_discovered_scope_headers(monkeypatch):
+    # Override scope discovery to return concrete header values.
     monkeypatch.setattr(
         boomnow_http,
-        "_discover_scope",
-        lambda session, headers: {
-            "team_ids": {"team-1", "team-2"},
-            "org_ids": {"org-9"},
-            "company_ids": set(),
-            "tenant_ids": set(),
-            "region_ids": set(),
-            "zone_ids": set(),
+        "_discover_scope_headers",
+        lambda session: {
+            "X-Requested-With": "XMLHttpRequest",
+            "X-Team-Id": "team-2",
+            "X-Org-Id": "org-9",
         },
         raising=False,
     )
@@ -309,30 +293,19 @@ def test_provider_attempts_scope_header_variants(monkeypatch):
 
     attempts = []
 
-    def _team_header(headers):
-        for key in ("X-Team-Id", "X-Team-ID"):
-            if headers.get(key):
-                return headers.get(key)
-        return None
-
-    def _org_header(headers):
-        for key in ("X-Org-Id", "X-Org-ID", "X-Organization-Id"):
-            if headers.get(key):
-                return headers.get(key)
-        return None
-
     def fake_get(self, url, headers=None, timeout=None):
-        attempts.append((url, _team_header(headers), _org_header(headers)))
-        if _team_header(headers) == "team-2" and _org_header(headers) == "org-9":
-            return DummyResponse(winning_payload)
-        return DummyResponse({"devices": []})
+        attempts.append((url, headers.get("X-Team-Id"), headers.get("X-Org-Id")))
+        return DummyResponse(winning_payload)
 
     monkeypatch.setattr(requests.Session, "get", fake_get)
 
     provider = BoomNowHttpProvider()
     devices = provider.get_devices()
 
-    assert any(team == "team-2" for _, team, _ in attempts)
+    assert attempts
+    _, team_id, org_id = attempts[0]
+    assert team_id == "team-2"
+    assert org_id == "org-9"
     assert len(devices) == 1
     assert devices[0].id == "winner"
 

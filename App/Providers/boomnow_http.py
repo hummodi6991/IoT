@@ -1,6 +1,5 @@
-import os, re, json, time, requests
-from urllib.parse import urlencode
-from typing import List, Union, Any, Dict, Iterable, Set, Optional
+import os, re, json, requests
+from typing import List, Union, Any, Dict, Iterable, Optional
 from app.device import Device
 from .base import DeviceStatusProvider
 
@@ -21,56 +20,15 @@ EMAIL = os.environ.get("BOOMNOW_EMAIL")
 PASSWORD = os.environ.get("BOOMNOW_PASSWORD")
 
 DEFAULT_HEADERS = {"Accept": "application/json", "User-Agent": "iot-monitor/1.0"}
-
-SCOPE_HEADER_MAP = {
-    "team_ids": ["X-Team-Id", "X-Team-ID"],
-    "org_ids": ["X-Org-Id", "X-Org-ID", "X-Organization-Id"],
-    "company_ids": ["X-Company-Id", "X-Company-ID"],
-    "tenant_ids": ["X-Tenant-Id", "X-Tenant-ID"],
-    "region_ids": ["X-Region-Id", "X-Region-ID"],
-    "zone_ids": ["X-Zone-Id", "X-Zone-ID"],
-}
-
-SCOPE_PARAM_MAP = {
-    "team_ids": ["team_id", "teamId"],
-    "org_ids": ["org_id", "organization_id", "organizationId", "orgId"],
-    "company_ids": ["company_id", "companyId"],
-    "tenant_ids": ["tenant_id", "tenantId"],
-    "region_ids": ["region_id", "regionId"],
-    "zone_ids": ["zone_id", "zoneId"],
-}
+HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT_SECONDS", "8"))
 
 
-def _robust_json(resp):
-    """Return JSON payload or None. Accepts empty strings & strips common preambles."""
-
+def _safe_json(resp: requests.Response) -> Optional[Any]:
     try:
         return resp.json()
-    except ValueError:
-        txt = resp.text or ""
-        s = txt.strip()
-        if not s or s.lower() == "null":
-            return {}
-        for pre in ("while(1);", "for(;;);", ")]}'", ")]}'\n"):
-            if s.startswith(pre):
-                s = s[len(pre):].lstrip()
-                break
-        try:
-            import json as _json
+    except Exception:
+        return None
 
-            return _json.loads(s)
-        except Exception:
-            return None
-
-
-def _json_get(sesh: requests.Session, url: str, headers: Dict[str, str], timeout: int = 30):
-    """GET JSON with common error handling. Returns (payload, response)."""
-    r = sesh.get(url, headers=headers, timeout=timeout)
-    r.raise_for_status()
-    try:
-        return r.json(), r
-    except ValueError:
-        return None, r
 
 def _extract_csrf(html: str):
     m = re.search(r'<meta[^>]+name=["\']csrf-token["\'][^>]+content=["\']([^"\']+)["\']', html, re.I)
@@ -87,7 +45,12 @@ def _login_session() -> requests.Session:
 
     if LOGIN_KIND == "json":
         # JSON login: {"email": "...", "password": "..."}
-        resp = s.post(LOGIN_URL, json={"email": EMAIL, "password": PASSWORD}, timeout=30, allow_redirects=True)
+        resp = s.post(
+            LOGIN_URL,
+            json={"email": EMAIL, "password": PASSWORD},
+            timeout=HTTP_TIMEOUT,
+            allow_redirects=True,
+        )
         resp.raise_for_status()
         # Some APIs return a token instead of cookie-based auth. If present, attach it.
         try:
@@ -100,7 +63,11 @@ def _login_session() -> requests.Session:
         # ---- Warm up the server session so it selects the default team/org ----
         try:
             # These are harmless if they 404; they just help the server set session context.
-            s.get(f"{BASE_URL}/dashboard/iot", headers={"Referer": f"{BASE_URL}/"}, timeout=20)
+            s.get(
+                f"{BASE_URL}/dashboard/iot",
+                headers={"Referer": f"{BASE_URL}/"},
+                timeout=HTTP_TIMEOUT,
+            )
             for path in (
                 "/api/get-current-user",
                 "/api/teams",
@@ -110,7 +77,7 @@ def _login_session() -> requests.Session:
                 "/api/zone?include_counts=false",
             ):
                 try:
-                    s.get(f"{BASE_URL}{path}", timeout=20)
+                    s.get(f"{BASE_URL}{path}", timeout=HTTP_TIMEOUT)
                 except Exception:
                     pass
         except Exception:
@@ -118,7 +85,7 @@ def _login_session() -> requests.Session:
         return s
 
     # HTML/form login with CSRF
-    getp = s.get(LOGIN_URL, timeout=30)
+    getp = s.get(LOGIN_URL, timeout=HTTP_TIMEOUT)
     getp.raise_for_status()
     csrf = _extract_csrf(getp.text)
 
@@ -131,9 +98,63 @@ def _login_session() -> requests.Session:
         form["authenticity_token"] = csrf
 
     headers = {"Referer": LOGIN_URL, "Origin": BASE_URL or LOGIN_URL.split("/api")[0]}
-    postp = s.post(LOGIN_URL, data=form, headers=headers, timeout=30, allow_redirects=True)
+    postp = s.post(
+        LOGIN_URL,
+        data=form,
+        headers=headers,
+        timeout=HTTP_TIMEOUT,
+        allow_redirects=True,
+    )
     postp.raise_for_status()
     return s
+
+
+def _discover_scope_headers(s: requests.Session) -> Dict[str, str]:
+    """Fetch user/team info and synthesize likely scope headers."""
+
+    hdrs: Dict[str, str] = {"X-Requested-With": "XMLHttpRequest"}
+
+    try:
+        cu = s.get(f"{BASE_URL}/api/get-current-user", timeout=HTTP_TIMEOUT)
+        cuj = _safe_json(cu) or {}
+        teams = s.get(f"{BASE_URL}/api/teams", timeout=HTTP_TIMEOUT)
+        tjson = _safe_json(teams) or {}
+
+        ids: List[str] = []
+
+        def collect(node: Any) -> None:
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    if isinstance(value, (int, str)) and re.search(
+                        r"(team|tenant|company|org)[-_]?id",
+                        key,
+                        re.IGNORECASE,
+                    ):
+                        ids.append(str(value))
+                    else:
+                        collect(value)
+            elif isinstance(node, list):
+                for item in node:
+                    collect(item)
+
+        collect(cuj)
+        collect(tjson)
+
+        val = next((candidate for candidate in ids if candidate and candidate.isdigit()), None)
+        if val:
+            hdrs.update(
+                {
+                    "X-Company-Id": val,
+                    "X-Org-Id": val,
+                    "X-Organization-Id": val,
+                    "X-Team-Id": val,
+                    "X-Tenant-Id": val,
+                }
+            )
+    except Exception:
+        pass
+
+    return hdrs
 
 def _coerce_online(value: Union[str, int, float, bool, None]) -> bool:
     # Accept real booleans and 0/1 first
@@ -323,314 +344,82 @@ def _extract_device_dicts(payload: Any) -> List[Dict[str, Any]]:
     return normalized
 
 
-def _collect_ids_from_payload(p: Any) -> Dict[str, Set[str]]:
-    """Collect likely scoping identifiers (team/org/company/tenant/region/zone) from arbitrary JSON."""
-    out: Dict[str, Set[str]] = {
-        "team_ids": set(),
-        "org_ids": set(),
-        "company_ids": set(),
-        "tenant_ids": set(),
-        "region_ids": set(),
-        "zone_ids": set(),
-    }
-
-    def _add(val, bucket):
-        if val is None:
-            return
-        s = str(val).strip()
-        if s:
-            out[bucket].add(s)
-
-    def _walk(x):
-        if isinstance(x, dict):
-            for k in ("team_id", "teamId"):
-                _add(x.get(k), "team_ids")
-            for k in ("org_id", "organization_id", "organizationId"):
-                _add(x.get(k), "org_ids")
-            for k in ("company_id", "companyId"):
-                _add(x.get(k), "company_ids")
-            for k in ("tenant_id", "tenantId"):
-                _add(x.get(k), "tenant_ids")
-            for k in ("region_id", "regionId"):
-                _add(x.get(k), "region_ids")
-            for k in ("zone_id", "zoneId"):
-                _add(x.get(k), "zone_ids")
-            for container, bucket in (
-                ("teams", "team_ids"),
-                ("organizations", "org_ids"),
-                ("companies", "company_ids"),
-                ("tenants", "tenant_ids"),
-                ("regions", "region_ids"),
-                ("zones", "zone_ids"),
-            ):
-                if container in x and isinstance(x[container], list):
-                    for row in x[container]:
-                        if isinstance(row, dict):
-                            _add(row.get("id"), bucket)
-            for v in x.values():
-                _walk(v)
-        elif isinstance(x, list):
-            for v in x:
-                _walk(v)
-
-    _walk(p)
-    return out
-
-
-def _discover_scope(session: requests.Session, headers: Dict[str, str]) -> Dict[str, Set[str]]:
-    """Hit a few light endpoints to learn team/org/region/zone IDs so we can scope device queries."""
-    out: Dict[str, Set[str]] = {
-        "team_ids": set(),
-        "org_ids": set(),
-        "company_ids": set(),
-        "tenant_ids": set(),
-        "region_ids": set(),
-        "zone_ids": set(),
-    }
-
-    def _merge(found):
-        for k, v in found.items():
-            out[k].update(v)
-
-    probes = [
-        "/api/get-current-user",
-        "/api/teams",
-        "/api/config",
-        "/api/all",
-        "/api/region?include_counts=false",
-        "/api/zone?include_counts=false",
-    ]
-    for pth in probes:
-        try:
-            payload, _ = _json_get(session, f"{BASE_URL}{pth}", headers, timeout=20)
-            if payload is not None:
-                _merge(_collect_ids_from_payload(payload))
-        except Exception:
-            continue
-    return out
-
-
-def _apply_scope_headers(
-    headers: Dict[str, str],
-    scope: Dict[str, Set[str]],
-    session: Optional[requests.Session] = None,
-) -> List[Dict[str, str]]:
-    """Populate common scoping headers (X-Org-Id, etc.) using discovered identifiers.
-
-    Returns a list of header variants to attempt in addition to the base headers.
-    Values are *not* logged; callers must avoid printing them.
-    """
-
-    # Prepare a default header set (first value for each bucket) for backward compatibility.
-    default_headers: Dict[str, str] = {}
-    for bucket, header_names in SCOPE_HEADER_MAP.items():
-        values = list(scope.get(bucket) or [])
-        if not values:
-            continue
-        default_headers[header_names[0]] = values[0]
-
-    if default_headers:
-        headers.update(default_headers)
-        if session is not None:
-            session.headers.update(default_headers)
-
-    # Build variants including combinations of values for each header bucket.
-    variants: List[Dict[str, str]] = [{}]
-
-    def _dedupe(seq: List[Dict[str, str]]) -> List[Dict[str, str]]:
-        seen = set()
-        unique: List[Dict[str, str]] = []
-        for item in seq:
-            key = tuple(sorted(item.items()))
-            if key not in seen:
-                seen.add(key)
-                unique.append(item)
-        return unique
-
-    for bucket, header_names in SCOPE_HEADER_MAP.items():
-        values = list(scope.get(bucket) or [])
-        if not values:
-            continue
-        updated: List[Dict[str, str]] = []
-        for base_variant in variants:
-            updated.append(base_variant)
-            for value in values:
-                for header_name in header_names:
-                    variant = dict(base_variant)
-                    variant[header_name] = value
-                    updated.append(variant)
-        variants = _dedupe(updated)
-
-    return _dedupe(variants)
-
-
 class BoomNowHttpProvider(DeviceStatusProvider):
     def get_devices(self) -> List[Device]:
         if not BASE_URL:
             raise RuntimeError("BOOMNOW_BASE_URL must be set for boomnow_http provider")
 
-        # Build endpoint candidates (respect env override but also try known fallbacks)
-        preferred_endpoints = [
-            "/api/iot-devices",
-            "/api/devices",
-            "/api/locks",
-            "/api/all",
+        def _with_q(ep: str, q: str) -> str:
+            base = f"{BASE_URL}{ep}"
+            if q:
+                base += ("&" if "?" in base else "?") + q
+            return base
+
+        query = DEVICES_QUERY or "size=100"
+        candidates = [
+            _with_q(DEVICES_ENDPOINT, query),
+            _with_q("/api/iot-devices", query),
+            _with_q("/api/all", query),
         ]
-        endpoints: List[str] = []
-        if DEVICES_ENDPOINT:
-            endpoints.append(DEVICES_ENDPOINT)
-        for ep in preferred_endpoints:
-            if ep not in endpoints:
-                endpoints.append(ep)
+
         headers = dict(DEFAULT_HEADERS)
         headers.setdefault("X-Requested-With", "XMLHttpRequest")
-        # Optional extra headers (tenant/org scoping)
         if EXTRA_HEADERS:
             try:
                 headers.update(json.loads(EXTRA_HEADERS))
             except Exception:
                 pass
 
+        session: Optional[requests.Session] = None
         if API_KEY:
+            headers["Authorization"] = f"Bearer {API_KEY}"
             session = requests.Session()
             session.headers.update(headers)
-            session.headers["Authorization"] = f"Bearer {API_KEY}"
-            headers["Authorization"] = f"Bearer {API_KEY}"
+            headers.update(_discover_scope_headers(session))
         else:
             session = _login_session()
-            session.headers.update(headers)
             headers.setdefault("Origin", BASE_URL)
             headers.setdefault("Referer", BASE_URL + "/dashboard/iot")
-            session.headers.setdefault("Origin", headers["Origin"])
-            session.headers.setdefault("Referer", headers["Referer"])
+            headers.update(_discover_scope_headers(session))
 
-        # Discover scope (team/org/region/zone) to try parameter variants automatically
-        scope = _discover_scope(session, headers)
-        header_variants = _apply_scope_headers(headers, scope, session=session)
-        if not header_variants:
-            header_variants = [{}]
-        base_headers = dict(headers)
-
-        # Build parameter variants (empty first, then scoped attempts)
-        def _dedupe_dict_list(rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
-            seen = set()
-            uniq: List[Dict[str, str]] = []
-            for row in rows:
-                key = tuple(sorted(row.items()))
-                if key not in seen:
-                    seen.add(key)
-                    uniq.append(row)
-            return uniq
-
-        param_variants: List[Dict[str, str]] = [{}]
-        for bucket, keys in SCOPE_PARAM_MAP.items():
-            values = list(scope.get(bucket) or [])
-            if not values:
-                continue
-            expanded: List[Dict[str, str]] = []
-            for base_variant in param_variants:
-                expanded.append(base_variant)
-                for value in values:
-                    for key in keys:
-                        variant = dict(base_variant)
-                        variant[key] = value
-                        expanded.append(variant)
-            param_variants = _dedupe_dict_list(expanded)
-
-        # Pagination / listing permutations (JSON:API & common styles)
-        paging_variants: List[Dict[str, str]] = [
-            {},  # no explicit paging
-            {"size": "100"},
-            {"page": "0", "size": "100"},
-            {"page": "1", "size": "100"},
-            {"perPage": "100"},
-            {"page[number]": "1", "page[size]": "100"},
-            {"limit": "100"},
-            {"limit": "100", "offset": "0"},
-        ]
-        paging_variants = _dedupe_dict_list(paging_variants)
-
-        # Helper to assemble URL with DEVICES_QUERY + a param map (properly encodes page[size])
-        def _build_url(ep: str, extra_params: Dict[str, str]) -> str:
-            base = f"{BASE_URL}{ep}"
-            qparts = []
-            if DEVICES_QUERY:
-                qparts.append(DEVICES_QUERY)  # keep any user-supplied query as-is
-            if extra_params:
-                qparts.append(urlencode(extra_params, doseq=True))
-            q = "&".join([p for p in qparts if p])
-            return base + (("?" + q) if q else "")
-
-        payload = None
+        payload: Optional[Any] = None
         items: List[Dict[str, Any]] = []
-        last_url = None
-        attempts: List[str] = []
-        MAX_ATTEMPTS = 800  # safety cap while exploring combinations
-        for ep in endpoints:
-            for scope_params in param_variants:
-                for header_variant in header_variants:
-                    current_headers = dict(base_headers)
-                    for aliases in SCOPE_HEADER_MAP.values():
-                        if any(alias in header_variant for alias in aliases):
-                            for alias in aliases:
-                                if alias not in header_variant:
-                                    current_headers.pop(alias, None)
-                    current_headers.update(header_variant)
-                    for page_params in paging_variants:
-                        params = dict(scope_params)
-                        params.update(page_params)
-                        url = _build_url(ep, params)
-                        last_url = url
-                        attempts.append(url)
-                        try:
-                            r = session.get(url, headers=current_headers, timeout=30)
-                        except requests.RequestException as exc:
-                            payload = None
-                            resp = getattr(exc, "response", None)
-                            if resp is not None and 500 <= resp.status_code < 600:
-                                time.sleep(0.5)
-                            continue
-                        try:
-                            r.raise_for_status()
-                            payload = _robust_json(r)
-                        except requests.HTTPError as e:
-                            if r.status_code == 401:
-                                raise RuntimeError(
-                                    "401 Unauthorized: check service creds / LOGIN_KIND / LOGIN_URL"
-                                ) from e
-                            if 500 <= r.status_code < 600:
-                                time.sleep(0.5)
-                            payload = None
-                            continue
-                        if payload is None:
-                            continue
-                        items = _extract_device_dicts(payload) if payload is not None else []
-                        if items:
-                            break
-                    if items or len(attempts) >= MAX_ATTEMPTS:
-                        break
-                if items or len(attempts) >= MAX_ATTEMPTS:
-                    break
-            if items or len(attempts) >= MAX_ATTEMPTS:
-                break
-        if payload is None:
-            if DEBUG_PROVIDER:
-                try:
-                    print(f"[provider] nonjson_content_type={r.headers.get('content-type')}")
-                    snippet = (r.text or "")[:400]
-                    print(f"[provider] nonjson_snippet={snippet}")
-                except Exception:
-                    pass
-            payload = {}
+        last_url: Optional[str] = None
+        response: Optional[requests.Response] = None
 
-        # Normalize payload to a list of device dicts (already done, but re-run for clarity)
-        items = _extract_device_dicts(payload)
+        for url in candidates:
+            last_url = url
+            try:
+                assert session is not None
+                response = session.get(url, headers=headers, timeout=HTTP_TIMEOUT)
+            except requests.RequestException:
+                payload = None
+                continue
+
+            try:
+                response.raise_for_status()
+            except requests.HTTPError as exc:
+                if response.status_code == 401:
+                    raise RuntimeError(
+                        "401 Unauthorized: check service creds / LOGIN_KIND / LOGIN_URL"
+                    ) from exc
+                payload = None
+                continue
+
+            payload = _safe_json(response)
+            if payload is None:
+                continue
+
+            items = _extract_device_dicts(payload)
+            if items:
+                break
+
+        if payload is None:
+            ct = response.headers.get("content-type") if response is not None else None
+            raise RuntimeError(f"Expected JSON but got content-type={ct}")
 
         if DEBUG_PROVIDER:
             top = list(payload.keys())[:10] if isinstance(payload, dict) else [type(payload).__name__]
-            print(f"[provider] attempts={min(len(attempts),10)} shown / {len(attempts)} total")
-            for i, u in enumerate(attempts[:10], 1):
-                print(f"[provider] try[{i}] {u}")
             print(f"[provider] url={last_url}")
             print(f"[provider] top_keys={top} items_count={len(items)}")
             if items:
