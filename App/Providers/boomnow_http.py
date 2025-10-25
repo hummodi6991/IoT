@@ -1,99 +1,80 @@
-import os, re, json, time, requests
-from typing import List, Union, Any, Dict, Iterable, Optional
+import os, re, json, requests
+from typing import List, Union, Any, Dict, Iterable, Tuple
+from urllib.parse import urlencode
 from app.device import Device
 from .base import DeviceStatusProvider
 
+# --------------------
+# Config (env-driven)
+# --------------------
 BASE_URL = os.environ.get("BOOMNOW_BASE_URL", "").rstrip("/")
 DEVICES_ENDPOINT = os.environ.get("BOOMNOW_DEVICES_ENDPOINT", "/api/devices")
 DEVICES_JSON_PATH = (os.environ.get("BOOMNOW_DEVICES_JSON_PATH") or "").strip()
-DEBUG_PROVIDER = (os.environ.get("DEBUG_PROVIDER", "0") == "1")
 DEVICES_QUERY = (os.environ.get("BOOMNOW_DEVICES_QUERY") or "").lstrip("?")
 EXTRA_HEADERS = os.environ.get("BOOMNOW_EXTRA_HEADERS")  # JSON dict, optional
+DEBUG_PROVIDER = (os.environ.get("DEBUG_PROVIDER", "0") == "1")
 
+# Auth
 API_KEY = os.environ.get("BOOMNOW_API_KEY")
-
 LOGIN_URL = os.environ.get("BOOMNOW_LOGIN_URL")
 LOGIN_KIND = (os.environ.get("BOOMNOW_LOGIN_KIND") or "form").lower()  # "json" or "form"
 EMAIL = os.environ.get("BOOMNOW_EMAIL")
 PASSWORD = os.environ.get("BOOMNOW_PASSWORD")
 
+# Runtime limits
+REQ_TIMEOUT = 10
+ATTEMPT_LIMIT = 24
+
 DEFAULT_HEADERS = {"Accept": "application/json", "User-Agent": "iot-monitor/1.0"}
 
+# Candidate endpoints to sweep if DEVICES_ENDPOINT is not sufficient
+ENDPOINT_CANDIDATES = []
+if DEVICES_ENDPOINT:
+    ENDPOINT_CANDIDATES.append(DEVICES_ENDPOINT)
+ENDPOINT_CANDIDATES += ["/api/iot-devices", "/api/locks", "/api/devices", "/api/all"]
 
-def _d(msg: str):
-    if DEBUG_PROVIDER:
-        print(f"[provider] {time.strftime('%H:%M:%S')} {msg}", flush=True)
+# Header names many backends use to scope requests
+SCOPE_HEADER_NAMES = (
+    "X-Team-Id", "X-Team-ID",
+    "X-Company-Id", "X-Company-ID",
+    "X-Org-Id", "X-Organization-Id",
+    "X-Tenant-Id", "X-Tenant-ID",
+)
 
+# Query param names commonly used to scope requests
+SCOPE_QUERY_NAMES = (
+    "team_id", "teamId",
+    "tenant_id", "tenantId",
+    "company_id", "companyId",
+    "org_id", "orgId",
+)
 
+UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+# --------------------
+# Utilities
+# --------------------
 def _extract_csrf(html: str):
     m = re.search(r'<meta[^>]+name=["\']csrf-token["\'][^>]+content=["\']([^"\']+)["\']', html, re.I)
-    if m:
-        return m.group(1)
+    if m: return m.group(1)
     m = re.search(r'name=["\']authenticity_token["\'][^>]*value=["\']([^"\']+)["\']', html, re.I)
     return m.group(1) if m else None
 
-
-def _login_session() -> requests.Session:
-    if not (LOGIN_URL and EMAIL and PASSWORD):
-        raise RuntimeError("Service login requested but BOOMNOW_LOGIN_URL/EMAIL/PASSWORD not set")
-    s = requests.Session()
-    s.headers.update(DEFAULT_HEADERS)
-    t0 = time.time()
-
-    if LOGIN_KIND == "json":
-        _d(f"login(kind=json) POST {LOGIN_URL}")
-        resp = s.post(LOGIN_URL, json={"email": EMAIL, "password": PASSWORD}, timeout=20, allow_redirects=True)
-        resp.raise_for_status()
-        try:
-            data = resp.json()
-            token = data.get("token") or data.get("jwt") or data.get("access_token") or data.get("apiKey")
-            if token:
-                s.headers.update({"Authorization": f"Bearer {token}"})
-                _d("login: bearer token attached")
-        except Exception:
-            pass
-        _d(f"login(kind=json) done in {time.time()-t0:.2f}s")
-        return s
-
-    _d(f"login(kind=form) GET {LOGIN_URL}")
-    getp = s.get(LOGIN_URL, timeout=20)
-    getp.raise_for_status()
-    csrf = _extract_csrf(getp.text)
-    form = {"email": EMAIL, "password": PASSWORD}
-    if re.search(r'name=["\']user\[email\]["\']', getp.text, re.I):
-        form = {"user[email]": EMAIL, "user[password]": PASSWORD}
-    if csrf:
-        form["authenticity_token"] = csrf
-    headers = {"Referer": LOGIN_URL, "Origin": BASE_URL or LOGIN_URL.split("/api")[0]}
-    _d(f"login(kind=form) POST {LOGIN_URL}")
-    postp = s.post(LOGIN_URL, data=form, headers=headers, timeout=20, allow_redirects=True)
-    postp.raise_for_status()
-    _d(f"login(kind=form) done in {time.time()-t0:.2f}s")
-    return s
-
-
-def _safe_json(resp) -> Any:
-    """
-    Robust JSON loader that tolerates BOM, anti-XSSI prefixes, and HTML error pages.
-    """
-    ct = resp.headers.get("content-type", "")
-    txt = resp.text or ""
-    raw = txt.lstrip("\ufeff").lstrip()
-    for p in (")]}',\n", "while(1);", "for(;;);"):
-        if raw.startswith(p):
-            raw = raw[len(p):].lstrip()
-            break
-    if raw[:10].lower().startswith("<!doctype") or raw[:5].lower().startswith("<html"):
-        raise RuntimeError(f"Expected JSON but got HTML; ct={ct}; snippet={raw[:140]!r}")
-    first = [i for i in (raw.find("{"), raw.find("[")) if i >= 0]
-    if first:
-        start = min(first)
-        raw = raw[start:]
+def _safe_json(resp) -> Tuple[bool, Any]:
     try:
-        return json.loads(raw)
-    except Exception as ex:
-        raise RuntimeError(f"Expected JSON but could not decode; ct={ct}; snippet={raw[:220]!r}") from ex
+        return True, resp.json()
+    except Exception:
+        try:
+            return False, (resp.text or "")[:1200]
+        except Exception:
+            return False, ""
 
+def _join_query(url: str, extra: Union[str, Dict[str, Any]]):
+    if not extra:
+        return url
+    if isinstance(extra, dict):
+        extra = urlencode(extra, doseq=True)
+    return url + (("&" if "?" in url else "?") + extra)
 
 def _get_by_path(obj: Any, path: str):
     if not path:
@@ -106,35 +87,29 @@ def _get_by_path(obj: Any, path: str):
             return None
     return cur
 
-
 def _looks_like_device_wrapper(d: Any) -> bool:
-    if not isinstance(d, dict):
-        return False
-    for k in ("id", "deviceId", "device_id", "uuid", "lockId", "serialNumber", "name", "deviceName", "status", "online"):
-        if k in d:
-            return True
-    for key in ("node", "device", "attributes", "details", "meta", "metadata", "info", "data"):
-        if key in d and isinstance(d[key], dict):
-            if _looks_like_device_wrapper(d[key]):
-                return True
-    return False
-
+    return isinstance(d, dict) and any(
+        k in d for k in (
+            "id","deviceId","uuid","lockId","serialNumber","name","deviceName","label",
+            "online","isOnline","connected","status","statusText","statusColor"
+        )
+    ) or (isinstance(d, dict) and any(
+        k in d and isinstance(d[k], dict) for k in ("node","device","attributes","details","meta","metadata","info","data")
+    ))
 
 def _unwrap_device_dict(item: Any) -> Dict[str, Any]:
-    if not isinstance(item, dict):
-        return item
-    for key in ("node", "device", "attributes", "details", "meta", "metadata", "info", "data"):
+    if not isinstance(item, dict): return item
+    for key in ("node","device","attributes","details","meta","metadata","info","data"):
         if key in item and isinstance(item[key], dict):
-            outer = {k: v for k, v in item.items() if k != key}
+            outer = {k:v for k,v in item.items() if k != key}
             inner = _unwrap_device_dict(item[key])
             if isinstance(inner, dict):
                 merged = dict(inner)
-                for k, v in outer.items():
+                for k,v in outer.items():
                     if k not in merged:
                         merged[k] = v
                 return merged
     return item
-
 
 def _find_first_list_of_devices(o: Any):
     if isinstance(o, list):
@@ -151,196 +126,232 @@ def _find_first_list_of_devices(o: Any):
                 return found
     return None
 
-
 def _extract_device_dicts(payload: Any) -> List[Dict[str, Any]]:
     items = None
     if DEVICES_JSON_PATH:
         items = _get_by_path(payload, DEVICES_JSON_PATH)
+
     if items is None and isinstance(payload, dict):
-        for k in ("devices", "data", "items", "rows", "results", "list", "entries", "records", "content"):
+        for k in ("devices","data","items","rows","results","list","entries","records","content"):
             v = payload.get(k)
             if isinstance(v, list):
-                items = v
-                break
+                items = v; break
             if isinstance(v, dict) and any(isinstance(x, list) for x in v.values()):
                 for vv in v.values():
                     if isinstance(vv, list) and vv and all(isinstance(x, dict) for x in vv):
-                        items = vv
-                        break
-                if items is not None:
-                    break
+                        items = vv; break
+                if items is not None: break
         if items is None and isinstance(payload.get("list"), dict):
             lst = payload["list"]
-            for k in ("items", "rows", "data", "results", "entries", "records", "content"):
+            for k in ("items","rows","data","results","entries","records","content"):
                 v = lst.get(k)
                 if isinstance(v, list):
-                    items = v
-                    break
+                    items = v; break
+            if items is None:
+                for v in lst.values():
+                    if isinstance(v, list) and v and all(isinstance(x, dict) for x in v):
+                        items = v; break
+
     if items is None and isinstance(payload, list):
         items = payload
+
     if items is None:
         items = _find_first_list_of_devices(payload) or []
+
     if not isinstance(items, list):
         return []
-    normalized: List[Dict[str, Any]] = []
+
+    out: List[Dict[str, Any]] = []
     for it in items:
         if isinstance(it, dict):
-            normalized.append(_unwrap_device_dict(it))
-    return normalized
-
+            out.append(_unwrap_device_dict(it))
+    return out
 
 def _coerce_online(value: Union[str, int, float, bool, None]) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return value != 0
+    if isinstance(value, bool): return value
+    if isinstance(value, (int, float)): return value != 0
     if isinstance(value, str):
         v = value.strip().lower()
-        if v in {"true", "1", "yes", "online", "up", "connected", "active", "alive"}:
-            return True
-        if v in {"false", "0", "no", "offline", "down", "inactive", "disconnected", "no data", "unknown", "n/a", "na", "not available", "none", "null", "—", "-"}:
-            return False
+        if v in {"true","1","yes","online","up","connected","active","alive"}: return True
+        if v in {"false","0","no","offline","down","inactive","disconnected","no data","unknown","n/a","na","not available","none","null","—","-"}: return False
     return bool(value)
 
-
 def _discover_scope_ids(session: requests.Session) -> List[str]:
-    out: List[str] = []
-    for ep in ("/api/get-current-user", "/api/teams", "/api/all"):
+    """Pull candidate team/org/tenant ids from helper endpoints."""
+    hits = []
+    for path in ("/api/get-current-user", "/api/teams", "/api/all", "/api/config"):
         try:
-            url = f"{BASE_URL}{ep}"
-            _d(f"discover GET {url}")
-            r = session.get(url, timeout=8)
-            if r.status_code >= 400:
-                continue
-            data = _safe_json(r)
+            r = session.get(f"{BASE_URL}{path}", timeout=REQ_TIMEOUT)
+            ok, data = _safe_json(r)
+            if not ok or not isinstance(data, (dict, list)): continue
 
-            def harvest(obj):
-                if isinstance(obj, dict):
-                    for k, v in obj.items():
-                        lk = k.lower()
-                        if any(s in lk for s in ("team", "tenant", "org", "company", "account")) and isinstance(v, (str, int)):
-                            s = str(v)
-                            if s and s not in out:
-                                out.append(s)
-                        harvest(v)
-                elif isinstance(obj, list):
-                    for x in obj:
-                        harvest(x)
+            def walk(x, key_path=""):
+                if isinstance(x, dict):
+                    for k,v in x.items():
+                        kp = (key_path + "." + k).lstrip(".")
+                        walk(v, kp)
+                elif isinstance(x, list):
+                    for v in x[:50]:
+                        walk(v, key_path)
+                else:
+                    key_l = key_path.lower()
+                    if isinstance(x, str) and (UUID_RE.match(x) or ("team" in key_l or "tenant" in key_l or "org" in key_l or "company" in key_l)):
+                        hits.append(x)
+                    elif isinstance(x, int) and ("team" in key_l or "tenant" in key_l or "org" in key_l or "company" in key_l):
+                        hits.append(str(x))
 
-            harvest(data)
+            walk(data)
         except Exception:
-            continue
-    return out[:5]
+            pass
 
+    # De‑dupe while preserving order
+    seen, out = set(), []
+    for h in hits:
+        if h not in seen:
+            seen.add(h); out.append(h)
+    return out[:6]  # keep it tight
 
-def _scope_header_variants(scope_ids: List[str]) -> List[Dict[str, str]]:
-    variants: List[Dict[str, str]] = []
-    base_candidates = ("X-Team-Id", "X-Team-ID", "X-Org-Id", "X-Company-Id", "X-Tenant-Id")
-    for sid in scope_ids or [""]:
-        for h in base_candidates:
-            variants.append({h: sid, "X-Requested-With": "XMLHttpRequest"})
-    variants.append({"X-Requested-With": "XMLHttpRequest"})
-    return variants
+def _enumerate_array_paths(o: Any, prefix: str = "") -> List[str]:
+    paths = []
+    if isinstance(o, list):
+        if o and all(isinstance(x, dict) for x in o):
+            paths.append(prefix or "$")
+        for i, v in enumerate(o[:3]):
+            paths += _enumerate_array_paths(v, f"{prefix}[{i}]" if prefix else f"[{i}]")
+    elif isinstance(o, dict):
+        for k, v in o.items():
+            paths += _enumerate_array_paths(v, f"{prefix}.{k}" if prefix else k)
+    return paths
 
-
+# --------------------
+# Provider
+# --------------------
 class BoomNowHttpProvider(DeviceStatusProvider):
     def get_devices(self) -> List[Device]:
         if not BASE_URL:
             raise RuntimeError("BOOMNOW_BASE_URL must be set for boomnow_http provider")
 
-        def _build(ep: str, q: str) -> str:
-            u = f"{BASE_URL}{ep}"
-            if DEVICES_QUERY:
-                u += ("&" if "?" in u else "?") + DEVICES_QUERY
-            if q:
-                u += ("&" if "?" in u else "?") + q
-            return u
-
-        endpoints = [DEVICES_ENDPOINT, "/api/iot-devices", "/api/devices", "/api/locks"]
-        page_params = ["", "size=100", "page=1&size=100", "perPage=100", "limit=100", "limit=100&offset=0"]
-
+        # Build base headers
         headers = dict(DEFAULT_HEADERS)
         if EXTRA_HEADERS:
-            try:
-                headers.update(json.loads(EXTRA_HEADERS))
-            except Exception:
-                pass
+            try: headers.update(json.loads(EXTRA_HEADERS))
+            except Exception: pass
+
+        # Auth: API key or programmatic login
+        session = requests.Session()
+        session.headers.update(headers)
 
         if API_KEY:
-            headers["Authorization"] = f"Bearer {API_KEY}"
-            session = requests.Session()
+            session.headers["Authorization"] = f"Bearer {API_KEY}"
         else:
-            session = _login_session()
-            headers.setdefault("Origin", BASE_URL)
-            headers.setdefault("Referer", BASE_URL + "/dashboard/iot")
+            if not (LOGIN_URL and EMAIL and PASSWORD):
+                raise RuntimeError("BOOMNOW_LOGIN_URL/EMAIL/PASSWORD must be set when no API key is used")
+            if LOGIN_KIND == "json":
+                resp = session.post(LOGIN_URL, json={"email": EMAIL, "password": PASSWORD},
+                                    timeout=REQ_TIMEOUT, allow_redirects=True)
+                resp.raise_for_status()
+                # optional token in JSON responses
+                ok, data = _safe_json(resp)
+                if ok and isinstance(data, dict):
+                    token = data.get("token") or data.get("jwt") or data.get("access_token") or data.get("apiKey")
+                    if token:
+                        session.headers["Authorization"] = f"Bearer {token}"
+            else:
+                g = session.get(LOGIN_URL, timeout=REQ_TIMEOUT)
+                g.raise_for_status()
+                csrf = _extract_csrf(getattr(g, "text", "") or "")
+                form = {"email": EMAIL, "password": PASSWORD}
+                if re.search(r'name=["\']user\[email\]["\']', getattr(g, "text", "") or "", re.I):
+                    form = {"user[email]": EMAIL, "user[password]": PASSWORD}
+                if csrf: form["authenticity_token"] = csrf
+                headers2 = {"Referer": LOGIN_URL, "Origin": BASE_URL or LOGIN_URL.split("/api")[0]}
+                p = session.post(LOGIN_URL, data=form, headers=headers2, timeout=REQ_TIMEOUT, allow_redirects=True)
+                p.raise_for_status()
 
-        scope_ids = _discover_scope_ids(session) if not API_KEY else []
-        header_variants = _scope_header_variants(scope_ids)
-        header_variants.insert(0, {k: v for k, v in headers.items() if k.lower().startswith("x-")})
+        # Discover scoping ids (team/org/tenant/company) to try
+        ids = _discover_scope_ids(session)
 
-        attempts: List[str] = []
-        SAFETY_CAP = 30
+        # Build endpoint + query candidates
+        def _build(ep: str) -> str:
+            u = f"{BASE_URL}{ep}"
+            return _join_query(u, DEVICES_QUERY) if DEVICES_QUERY else u
+
+        endpoints = []
+        for ep in ENDPOINT_CANDIDATES:
+            u = _build(ep)
+            if u not in endpoints:
+                endpoints.append(u)
+
+        query_variants = [""]
+        for sid in ids:
+            for pname in SCOPE_QUERY_NAMES:
+                query_variants.append(f"{pname}={sid}")
+
+        header_variants = [dict(session.headers)]
+        for sid in ids:
+            for hname in SCOPE_HEADER_NAMES:
+                hv = dict(session.headers)
+                hv[hname] = sid
+                header_variants.append(hv)
+
+        # Sweep attempts (bounded)
+        tried = set()
+        attempt = 0
+        found_payload = None
         items: List[Dict[str, Any]] = []
-        payload: Optional[Any] = None
-        last_url = None
-        attempt_idx = 0
 
-        for ep in endpoints:
-            for qp in page_params:
-                for hv in header_variants:
-                    attempt_idx += 1
-                    if attempt_idx > SAFETY_CAP:
+        for url in endpoints:
+            for hv in header_variants:
+                for q in query_variants:
+                    if attempt >= ATTEMPT_LIMIT:
                         break
-                    req_headers = dict(headers)
-                    req_headers.update({k: v for k, v in hv.items() if v})
-                    url = _build(ep, qp)
-                    last_url = url
-                    try:
-                        t0 = time.time()
-                        r = session.get(url, headers=req_headers, timeout=10, allow_redirects=True)
-                        ct = r.headers.get("content-type", "")
-                        body_len = int(r.headers.get("content-length", "0") or 0) or len(r.content or b"")
-                        _d(f"try[{attempt_idx}] {url} -> {r.status_code} ct={ct} bytes={body_len}")
-                        if r.status_code >= 500:
-                            try:
-                                _d(f"server500 snippet={r.text[:140]!r}")
-                            except Exception:
-                                pass
-                            continue
-                        r.raise_for_status()
-                        payload = _safe_json(r)
-                    except Exception as ex:
-                        _d(f"try[{attempt_idx}] decode error: {ex}")
+                    full_url = _join_query(url, q) if q else url
+                    key = (full_url, tuple(sorted(hv.items())))
+                    if key in tried:
+                        continue
+                    tried.add(key)
+                    attempt += 1
+
+                    r = session.get(full_url, headers=hv, timeout=REQ_TIMEOUT)
+                    ct = r.headers.get("content-type")
+                    if DEBUG_PROVIDER:
+                        print(f"[provider] try[{attempt}] {full_url} => {r.status_code} ct={ct}")
+
+                    if r.status_code != 200:
                         continue
 
+                    is_json, payload = _safe_json(r)
+                    if not is_json:
+                        if DEBUG_PROVIDER:
+                            print(f"[provider] nonjson_snippet={payload[:400]}")
+                        continue
+
+                    found_payload = payload
+                    # First pass extraction
                     items = _extract_device_dicts(payload)
+                    if DEBUG_PROVIDER:
+                        top = list(payload.keys())[:10] if isinstance(payload, dict) else [type(payload).__name__]
+                        print(f"[provider] top_keys={top} items_count={len(items)}")
+                        if not items:
+                            try:
+                                cand_paths = _enumerate_array_paths(payload)
+                                if cand_paths:
+                                    print(f"[diag] array_candidates (first 12): {cand_paths[:12]}")
+                            except Exception:
+                                pass
                     if items:
-                        _d(f"items_count={len(items)} (success on {url})")
                         break
                 if items:
                     break
             if items:
                 break
 
-        if payload is None:
-            ct = "(none)"
-            if 'r' in locals():
-                ct = r.headers.get("content-type", "")
-            raise RuntimeError(f"Expected JSON but got content-type={ct}")
+        # If we never saw JSON, report content-type of the last response
+        if found_payload is None:
+            # We keep returning empty list so monitor doesn't crash; diagnostics already printed.
+            return []
 
-        if DEBUG_PROVIDER:
-            top = list(payload.keys())[:10] if isinstance(payload, dict) else [type(payload).__name__]
-            _d(f"url={last_url}")
-            _d(f"top_keys={top} items_count={len(items)}")
-            if items:
-                _d(f"sample_item_keys={list(items[0].keys())[:12]}")
-            else:
-                try:
-                    import json as _json
-                    _d(f"payload_snippet={_json.dumps(payload)[:1200]}")
-                except Exception:
-                    pass
-
+        # Normalize to Device objects
         out: List[Device] = []
         for item in items:
             did = str(
@@ -366,12 +377,10 @@ class BoomNowHttpProvider(DeviceStatusProvider):
                 or item.get("unitName")
                 or did
             )
+
             online_raw = (
-                item.get("online")
-                or item.get("isOnline")
-                or item.get("connected")
-                or item.get("is_online")
-                or item.get("onlineStatus")
+                item.get("online") or item.get("isOnline") or item.get("connected") or
+                item.get("is_online") or item.get("onlineStatus")
             )
             if online_raw is None and "status" in item:
                 status = item.get("status")
@@ -380,26 +389,19 @@ class BoomNowHttpProvider(DeviceStatusProvider):
                 else:
                     online_raw = status
             if online_raw is None:
-                indicator = (
-                    item.get("statusColor")
-                    or item.get("status_color")
-                    or item.get("indicator")
-                    or item.get("onlineColor")
-                    or item.get("statusDot")
-                )
+                indicator = (item.get("statusColor") or item.get("status_color") or
+                             item.get("indicator") or item.get("onlineColor") or item.get("statusDot"))
                 if indicator:
                     sv = str(indicator).strip().lower()
-                    if sv in {"green", "success", "ok"}:
-                        online_raw = True
-                    elif sv in {"red", "danger", "error"}:
-                        online_raw = False
+                    online_raw = True if sv in {"green","success","ok"} else False if sv in {"red","danger","error"} else None
+
             online = _coerce_online(online_raw)
 
             battery = None
-            for k in ("battery", "batteryPercent", "battery_percentage", "batteryLevel", "battery_level"):
+            for k in ("battery","batteryPercent","battery_percentage","batteryLevel","battery_level"):
                 if k in item and isinstance(item[k], (int, float)):
-                    battery = int(item[k])
-                    break
+                    battery = int(item[k]); break
 
             out.append(Device(id=did, name=name, online=online, battery=battery, extra=item))
+
         return out
