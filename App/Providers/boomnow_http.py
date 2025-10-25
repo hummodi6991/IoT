@@ -22,6 +22,15 @@ PASSWORD = os.environ.get("BOOMNOW_PASSWORD")
 
 DEFAULT_HEADERS = {"Accept": "application/json", "User-Agent": "iot-monitor/1.0"}
 
+SCOPE_HEADER_MAP = {
+    "team_ids": ["X-Team-Id", "X-Team-ID"],
+    "org_ids": ["X-Org-Id", "X-Org-ID", "X-Organization-Id"],
+    "company_ids": ["X-Company-Id", "X-Company-ID"],
+    "tenant_ids": ["X-Tenant-Id", "X-Tenant-ID"],
+    "region_ids": ["X-Region-Id", "X-Region-ID"],
+    "zone_ids": ["X-Zone-Id", "X-Zone-ID"],
+}
+
 
 def _robust_json(resp):
     """Return JSON payload or None. Accepts empty strings & strips common preambles."""
@@ -385,29 +394,58 @@ def _discover_scope(session: requests.Session, headers: Dict[str, str]) -> Dict[
     return out
 
 
-def _apply_scope_headers(headers: Dict[str, str], scope: Dict[str, Set[str]], session: Optional[requests.Session] = None) -> None:
-    """Populate common scoping headers (X-Org-Id, etc.) using discovered identifiers."""
+def _apply_scope_headers(
+    headers: Dict[str, str],
+    scope: Dict[str, Set[str]],
+    session: Optional[requests.Session] = None,
+) -> List[Dict[str, str]]:
+    """Populate common scoping headers (X-Org-Id, etc.) using discovered identifiers.
 
-    header_map = {
-        "team_ids": ["X-Team-Id", "X-Team-ID"],
-        "org_ids": ["X-Org-Id", "X-Org-ID", "X-Organization-Id"],
-        "company_ids": ["X-Company-Id", "X-Company-ID"],
-        "tenant_ids": ["X-Tenant-Id", "X-Tenant-ID"],
-        "region_ids": ["X-Region-Id", "X-Region-ID"],
-        "zone_ids": ["X-Zone-Id", "X-Zone-ID"],
-    }
+    Returns a list of header variants to attempt in addition to the base headers.
+    Values are *not* logged; callers must avoid printing them.
+    """
 
-    for bucket, header_names in header_map.items():
+    # Prepare a default header set (first value for each bucket) for backward compatibility.
+    default_headers: Dict[str, str] = {}
+    for bucket, header_names in SCOPE_HEADER_MAP.items():
         values = list(scope.get(bucket) or [])
         if not values:
             continue
-        value = values[0]
-        for header_name in header_names:
-            if header_name not in headers:
-                headers[header_name] = value
-                if session is not None:
-                    session.headers.setdefault(header_name, value)
-                break
+        default_headers[header_names[0]] = values[0]
+
+    if default_headers:
+        headers.update(default_headers)
+        if session is not None:
+            session.headers.update(default_headers)
+
+    # Build variants including combinations of values for each header bucket.
+    variants: List[Dict[str, str]] = [{}]
+
+    def _dedupe(seq: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        seen = set()
+        unique: List[Dict[str, str]] = []
+        for item in seq:
+            key = tuple(sorted(item.items()))
+            if key not in seen:
+                seen.add(key)
+                unique.append(item)
+        return unique
+
+    for bucket, header_names in SCOPE_HEADER_MAP.items():
+        values = list(scope.get(bucket) or [])
+        if not values:
+            continue
+        updated: List[Dict[str, str]] = []
+        for base_variant in variants:
+            updated.append(base_variant)
+            for value in values:
+                for header_name in header_names:
+                    variant = dict(base_variant)
+                    variant[header_name] = value
+                    updated.append(variant)
+        variants = _dedupe(updated)
+
+    return _dedupe(variants)
 
 
 class BoomNowHttpProvider(DeviceStatusProvider):
@@ -446,7 +484,10 @@ class BoomNowHttpProvider(DeviceStatusProvider):
 
         # Discover scope (team/org/region/zone) to try parameter variants automatically
         scope = _discover_scope(session, headers)
-        _apply_scope_headers(headers, scope, session=session)
+        header_variants = _apply_scope_headers(headers, scope, session=session)
+        if not header_variants:
+            header_variants = [{}]
+        base_headers = dict(headers)
 
         # Build parameter variants (empty first, then scoped attempts)
         param_variants: List[Dict[str, str]] = [{}]
@@ -494,30 +535,44 @@ class BoomNowHttpProvider(DeviceStatusProvider):
         items: List[Dict[str, Any]] = []
         last_url = None
         attempts: List[str] = []
-        MAX_ATTEMPTS = 80  # safety cap
+        MAX_ATTEMPTS = 800  # safety cap while exploring combinations
         for ep in endpoints:
             for scope_params in param_variants:
-                for page_params in paging_variants:
-                    params = dict(scope_params)
-                    params.update(page_params)
-                    url = _build_url(ep, params)
-                    last_url = url
-                    attempts.append(url)
-                    r = session.get(url, headers=headers, timeout=30)
-                    try:
-                        r.raise_for_status()
-                        payload = _robust_json(r)
-                    except requests.HTTPError as e:
-                        if r.status_code == 401:
-                            raise RuntimeError(
-                                "401 Unauthorized: check service creds / LOGIN_KIND / LOGIN_URL"
-                            ) from e
-                        payload = None
-                        continue
-                    if payload is None:
-                        continue
-                    items = _extract_device_dicts(payload) if payload is not None else []
-                    if items:
+                for header_variant in header_variants:
+                    current_headers = dict(base_headers)
+                    for aliases in SCOPE_HEADER_MAP.values():
+                        if any(alias in header_variant for alias in aliases):
+                            for alias in aliases:
+                                if alias not in header_variant:
+                                    current_headers.pop(alias, None)
+                    current_headers.update(header_variant)
+                    for page_params in paging_variants:
+                        params = dict(scope_params)
+                        params.update(page_params)
+                        url = _build_url(ep, params)
+                        last_url = url
+                        attempts.append(url)
+                        try:
+                            r = session.get(url, headers=current_headers, timeout=30)
+                        except requests.RequestException:
+                            payload = None
+                            continue
+                        try:
+                            r.raise_for_status()
+                            payload = _robust_json(r)
+                        except requests.HTTPError as e:
+                            if r.status_code == 401:
+                                raise RuntimeError(
+                                    "401 Unauthorized: check service creds / LOGIN_KIND / LOGIN_URL"
+                                ) from e
+                            payload = None
+                            continue
+                        if payload is None:
+                            continue
+                        items = _extract_device_dicts(payload) if payload is not None else []
+                        if items:
+                            break
+                    if items or len(attempts) >= MAX_ATTEMPTS:
                         break
                 if items or len(attempts) >= MAX_ATTEMPTS:
                     break

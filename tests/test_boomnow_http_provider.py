@@ -128,6 +128,31 @@ def test_extract_devices_handles_jsonapi_data_array():
     assert item["battery_level"] == 12
 
 
+def test_extract_devices_handles_nested_content_wrapped_dict():
+    payload = {
+        "list": {
+            "content": {
+                "records": [
+                    {
+                        "device": {
+                            "id": "wrapped-1",
+                            "attributes": {
+                                "name": "Inner Device",
+                                "status": "online",
+                            },
+                        }
+                    }
+                ]
+            }
+        }
+    }
+
+    items = _extract_device_dicts(payload)
+    assert len(items) == 1
+    assert items[0]["id"] == "wrapped-1"
+    assert items[0]["name"] == "Inner Device"
+
+
 def test_provider_returns_devices_from_wrapped_payload(monkeypatch):
     payload = {
         "data": {
@@ -241,4 +266,73 @@ def test_provider_interprets_string_and_indicator_status(monkeypatch):
     assert second.id == "indicator-2"
     assert second.online is True
     assert second.battery == 90
+
+
+def test_provider_attempts_scope_header_variants(monkeypatch):
+    # Override scope discovery to return multiple IDs so header variants are tried.
+    monkeypatch.setattr(
+        boomnow_http,
+        "_discover_scope",
+        lambda session, headers: {
+            "team_ids": {"team-1", "team-2"},
+            "org_ids": {"org-9"},
+            "company_ids": set(),
+            "tenant_ids": set(),
+            "region_ids": set(),
+            "zone_ids": set(),
+        },
+        raising=False,
+    )
+
+    winning_payload = {
+        "devices": [
+            {
+                "id": "winner",
+                "name": "Winning Device",
+                "status": "online",
+            }
+        ]
+    }
+
+    class DummyResponse:
+        def __init__(self, data, status=200):
+            self._data = data
+            self.status_code = status
+            self.headers = {"content-type": "application/json"}
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise requests.HTTPError(response=self)
+
+        def json(self):
+            return self._data
+
+    attempts = []
+
+    def _team_header(headers):
+        for key in ("X-Team-Id", "X-Team-ID"):
+            if headers.get(key):
+                return headers.get(key)
+        return None
+
+    def _org_header(headers):
+        for key in ("X-Org-Id", "X-Org-ID", "X-Organization-Id"):
+            if headers.get(key):
+                return headers.get(key)
+        return None
+
+    def fake_get(self, url, headers=None, timeout=None):
+        attempts.append((url, _team_header(headers), _org_header(headers)))
+        if _team_header(headers) == "team-2" and _org_header(headers) == "org-9":
+            return DummyResponse(winning_payload)
+        return DummyResponse({"devices": []})
+
+    monkeypatch.setattr(requests.Session, "get", fake_get)
+
+    provider = BoomNowHttpProvider()
+    devices = provider.get_devices()
+
+    assert any(team == "team-2" for _, team, _ in attempts)
+    assert len(devices) == 1
+    assert devices[0].id == "winner"
 
