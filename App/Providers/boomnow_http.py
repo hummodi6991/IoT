@@ -1,4 +1,4 @@
-import os, re, json, requests
+import os, re, json, time, requests
 from urllib.parse import urlencode
 from typing import List, Union, Any, Dict, Iterable, Set, Optional
 from app.device import Device
@@ -29,6 +29,15 @@ SCOPE_HEADER_MAP = {
     "tenant_ids": ["X-Tenant-Id", "X-Tenant-ID"],
     "region_ids": ["X-Region-Id", "X-Region-ID"],
     "zone_ids": ["X-Zone-Id", "X-Zone-ID"],
+}
+
+SCOPE_PARAM_MAP = {
+    "team_ids": ["team_id", "teamId"],
+    "org_ids": ["org_id", "organization_id", "organizationId", "orgId"],
+    "company_ids": ["company_id", "companyId"],
+    "tenant_ids": ["tenant_id", "tenantId"],
+    "region_ids": ["region_id", "regionId"],
+    "zone_ids": ["zone_id", "zoneId"],
 }
 
 
@@ -92,7 +101,14 @@ def _login_session() -> requests.Session:
         try:
             # These are harmless if they 404; they just help the server set session context.
             s.get(f"{BASE_URL}/dashboard/iot", headers={"Referer": f"{BASE_URL}/"}, timeout=20)
-            for path in ("/api/get-current-user", "/api/teams", "/api/all"):
+            for path in (
+                "/api/get-current-user",
+                "/api/teams",
+                "/api/config",
+                "/api/all",
+                "/api/region?include_counts=false",
+                "/api/zone?include_counts=false",
+            ):
                 try:
                     s.get(f"{BASE_URL}{path}", timeout=20)
                 except Exception:
@@ -453,15 +469,21 @@ class BoomNowHttpProvider(DeviceStatusProvider):
         if not BASE_URL:
             raise RuntimeError("BOOMNOW_BASE_URL must be set for boomnow_http provider")
 
-        # Build endpoint candidates
-        endpoints = [
-            DEVICES_ENDPOINT,
-            "/api/all",
+        # Build endpoint candidates (respect env override but also try known fallbacks)
+        preferred_endpoints = [
+            "/api/iot-devices",
             "/api/devices",
             "/api/locks",
-            "/api/iot-devices",
+            "/api/all",
         ]
+        endpoints: List[str] = []
+        if DEVICES_ENDPOINT:
+            endpoints.append(DEVICES_ENDPOINT)
+        for ep in preferred_endpoints:
+            if ep not in endpoints:
+                endpoints.append(ep)
         headers = dict(DEFAULT_HEADERS)
+        headers.setdefault("X-Requested-With", "XMLHttpRequest")
         # Optional extra headers (tenant/org scoping)
         if EXTRA_HEADERS:
             try:
@@ -490,23 +512,30 @@ class BoomNowHttpProvider(DeviceStatusProvider):
         base_headers = dict(headers)
 
         # Build parameter variants (empty first, then scoped attempts)
+        def _dedupe_dict_list(rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
+            seen = set()
+            uniq: List[Dict[str, str]] = []
+            for row in rows:
+                key = tuple(sorted(row.items()))
+                if key not in seen:
+                    seen.add(key)
+                    uniq.append(row)
+            return uniq
+
         param_variants: List[Dict[str, str]] = [{}]
-        for tid in scope["team_ids"]:
-            param_variants += [{"team_id": tid}, {"teamId": tid}]
-        for oid in scope["org_ids"]:
-            param_variants += [
-                {"org_id": oid},
-                {"organization_id": oid},
-                {"organizationId": oid},
-            ]
-        for cid in scope["company_ids"]:
-            param_variants += [{"company_id": cid}, {"companyId": cid}]
-        for ten in scope["tenant_ids"]:
-            param_variants += [{"tenant_id": ten}, {"tenantId": ten}]
-        for rid in scope["region_ids"]:
-            param_variants += [{"region_id": rid}, {"regionId": rid}]
-        for zid in scope["zone_ids"]:
-            param_variants += [{"zone_id": zid}, {"zoneId": zid}]
+        for bucket, keys in SCOPE_PARAM_MAP.items():
+            values = list(scope.get(bucket) or [])
+            if not values:
+                continue
+            expanded: List[Dict[str, str]] = []
+            for base_variant in param_variants:
+                expanded.append(base_variant)
+                for value in values:
+                    for key in keys:
+                        variant = dict(base_variant)
+                        variant[key] = value
+                        expanded.append(variant)
+            param_variants = _dedupe_dict_list(expanded)
 
         # Pagination / listing permutations (JSON:API & common styles)
         paging_variants: List[Dict[str, str]] = [
@@ -519,6 +548,7 @@ class BoomNowHttpProvider(DeviceStatusProvider):
             {"limit": "100"},
             {"limit": "100", "offset": "0"},
         ]
+        paging_variants = _dedupe_dict_list(paging_variants)
 
         # Helper to assemble URL with DEVICES_QUERY + a param map (properly encodes page[size])
         def _build_url(ep: str, extra_params: Dict[str, str]) -> str:
@@ -554,8 +584,11 @@ class BoomNowHttpProvider(DeviceStatusProvider):
                         attempts.append(url)
                         try:
                             r = session.get(url, headers=current_headers, timeout=30)
-                        except requests.RequestException:
+                        except requests.RequestException as exc:
                             payload = None
+                            resp = getattr(exc, "response", None)
+                            if resp is not None and 500 <= resp.status_code < 600:
+                                time.sleep(0.5)
                             continue
                         try:
                             r.raise_for_status()
@@ -565,6 +598,8 @@ class BoomNowHttpProvider(DeviceStatusProvider):
                                 raise RuntimeError(
                                     "401 Unauthorized: check service creds / LOGIN_KIND / LOGIN_URL"
                                 ) from e
+                            if 500 <= r.status_code < 600:
+                                time.sleep(0.5)
                             payload = None
                             continue
                         if payload is None:
