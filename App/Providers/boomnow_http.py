@@ -23,6 +23,28 @@ PASSWORD = os.environ.get("BOOMNOW_PASSWORD")
 DEFAULT_HEADERS = {"Accept": "application/json", "User-Agent": "iot-monitor/1.0"}
 
 
+def _robust_json(resp):
+    """Return JSON payload or None. Accepts empty strings & strips common preambles."""
+
+    try:
+        return resp.json()
+    except ValueError:
+        txt = resp.text or ""
+        s = txt.strip()
+        if not s or s.lower() == "null":
+            return {}
+        for pre in ("while(1);", "for(;;);", ")]}'", ")]}'\n"):
+            if s.startswith(pre):
+                s = s[len(pre):].lstrip()
+                break
+        try:
+            import json as _json
+
+            return _json.loads(s)
+        except Exception:
+            return None
+
+
 def _json_get(sesh, url, headers, timeout=30):
     """GET JSON with common error handling. Returns (payload, response)."""
     r = sesh.get(url, headers=headers, timeout=timeout)
@@ -468,7 +490,7 @@ class BoomNowHttpProvider(DeviceStatusProvider):
                     )
                     try:
                         r.raise_for_status()
-                        payload = r.json()
+                        payload = _robust_json(r)
                     except requests.HTTPError as e:
                         if r.status_code == 401:
                             raise RuntimeError(
@@ -476,8 +498,7 @@ class BoomNowHttpProvider(DeviceStatusProvider):
                             ) from e
                         payload = None
                         continue
-                    except Exception:
-                        payload = None
+                    if payload is None:
                         continue
                     items = _extract_device_dicts(payload) if payload is not None else []
                     if items:
@@ -487,8 +508,14 @@ class BoomNowHttpProvider(DeviceStatusProvider):
             if items or len(attempts) >= MAX_ATTEMPTS:
                 break
         if payload is None:
-            ct = r.headers.get("content-type")
-            raise RuntimeError(f"Expected JSON but got content-type={ct}")
+            if DEBUG_PROVIDER:
+                try:
+                    print(f"[provider] nonjson_content_type={r.headers.get('content-type')}")
+                    snippet = (r.text or "")[:400]
+                    print(f"[provider] nonjson_snippet={snippet}")
+                except Exception:
+                    pass
+            payload = {}
 
         # Normalize payload to a list of device dicts (already done, but re-run for clarity)
         items = _extract_device_dicts(payload)
