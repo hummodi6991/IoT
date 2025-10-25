@@ -43,7 +43,7 @@ python app/main.py
 ## Providers
 
 - **demo**: Uses an in-repo JSON file with a few fake devices to prove the pipeline end-to-end.
-- **boomnow_http**: A thin, configurable HTTP client. Point it at your IoT platform’s "list devices" endpoint and map fields in `providers/boomnow_http.py` if necessary.
+- **boomnow_http**: A thin, configurable HTTP client. Point it at your IoT platform’s "list devices" endpoint and map fields in `providers/boomnow_http.py` if necessary. The provider now auto-discovers tenant/team/org scope and common pagination patterns; if the payload structure is unusual you can override detection with `BOOMNOW_DEVICES_JSON_PATH` (e.g., `list.content`).
 
 If your platform can emit webhooks for "device offline/online", you can run `app/webhook.py` on a small host (Railway, Fly.io, Render, etc.) and configure the platform to call it; the same notifier + state logic will apply.
 
