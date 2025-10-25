@@ -23,9 +23,24 @@ EMAIL = os.environ.get("BOOMNOW_EMAIL")
 PASSWORD = os.environ.get("BOOMNOW_PASSWORD")
 
 DEFAULT_HEADERS = {"Accept": "application/json", "User-Agent": "iot-monitor/1.0"}
-HTTP_TIMEOUT = max(1, min(int(os.environ.get("HTTP_TIMEOUT_SECONDS", "8")), 6))
-CONNECT_TIMEOUT = min(HTTP_TIMEOUT, 4)
-MAX_CANDIDATE_ATTEMPTS = max(1, int(os.environ.get("BOOMNOW_MAX_ATTEMPTS", "3")))
+JSON_CT_HINTS = ("application/json", "text/json", "application/problem+json")
+REQ_TIMEOUT = float(
+    os.environ.get(
+        "BOOMNOW_TIMEOUT_SECONDS",
+        os.environ.get("HTTP_TIMEOUT_SECONDS", "12"),
+    )
+)
+HTTP_TIMEOUT = max(1.0, min(REQ_TIMEOUT, 15.0))
+CONNECT_TIMEOUT = min(HTTP_TIMEOUT, 4.0)
+MAX_TRIES = max(
+    1,
+    int(
+        os.environ.get(
+            "BOOMNOW_MAX_TRIES",
+            os.environ.get("BOOMNOW_MAX_ATTEMPTS", "3"),
+        )
+    ),
+)
 
 
 def _timeout() -> tuple:
@@ -33,9 +48,32 @@ def _timeout() -> tuple:
 
 
 def _safe_json(resp: requests.Response) -> Optional[Any]:
+    """Best-effort JSON loader tolerant of flaky content types and HTML errors."""
+
+    try:
+        ct = resp.headers.get("content-type", "").lower()
+    except Exception:
+        ct = ""
+
+    try:
+        if any(hint in ct for hint in JSON_CT_HINTS):
+            return resp.json()
+    except Exception:
+        pass
+
     try:
         return resp.json()
     except Exception:
+        try:
+            text = resp.text or ""
+        except Exception:
+            text = ""
+        snippet = text.lstrip()
+        if snippet.startswith("{") or snippet.startswith("["):
+            try:
+                return json.loads(snippet)
+            except Exception:
+                return None
         return None
 
 
@@ -129,51 +167,54 @@ def _login_session() -> requests.Session:
 
 
 def _discover_scope_headers(s: requests.Session) -> Dict[str, str]:
-    """Fetch user/team info and synthesize likely scope headers."""
+    """Query lightweight endpoints and return likely scoping headers."""
 
-    hdrs: Dict[str, str] = {"X-Requested-With": "XMLHttpRequest"}
+    headers: Dict[str, str] = {"X-Requested-With": "XMLHttpRequest"}
+    scope_id: Optional[str] = None
 
-    try:
-        cu = s.get(f"{BASE_URL}/api/get-current-user", timeout=_timeout())
-        cuj = _safe_json(cu) or {}
-        teams = s.get(f"{BASE_URL}/api/teams", timeout=_timeout())
-        tjson = _safe_json(teams) or {}
+    for url in (
+        "/api/teams?include_counts=false",
+        "/api/get-current-user",
+        "/api/teams",
+    ):
+        try:
+            resp = s.get(f"{BASE_URL}{url}", timeout=_timeout())
+        except Exception:
+            continue
 
-        ids: List[str] = []
+        data = _safe_json(resp) or {}
 
-        def collect(node: Any) -> None:
-            if isinstance(node, dict):
-                for key, value in node.items():
-                    if isinstance(value, (int, str)) and re.search(
-                        r"(team|tenant|company|org)[-_]?id",
-                        key,
-                        re.IGNORECASE,
-                    ):
-                        ids.append(str(value))
-                    else:
-                        collect(value)
-            elif isinstance(node, list):
-                for item in node:
-                    collect(item)
+        if isinstance(data, dict) and isinstance(data.get("teams"), list) and data["teams"]:
+            candidate = data["teams"][0].get("id")
+            if candidate:
+                scope_id = str(candidate)
+                break
 
-        collect(cuj)
-        collect(tjson)
+        for key in ("user", "currentUser"):
+            user = data.get(key) if isinstance(data, dict) else None
+            if not isinstance(user, dict):
+                continue
+            teams = user.get("teams") or user.get("orgs") or []
+            if isinstance(teams, list) and teams:
+                team = teams[0]
+                if isinstance(team, dict):
+                    candidate = team.get("id") or team.get("team_id") or team.get("org_id")
+                    if candidate:
+                        scope_id = str(candidate)
+                        break
+        if scope_id:
+            break
 
-        val = next((candidate for candidate in ids if candidate and candidate.isdigit()), None)
-        if val:
-            hdrs.update(
-                {
-                    "X-Company-Id": val,
-                    "X-Org-Id": val,
-                    "X-Organization-Id": val,
-                    "X-Team-Id": val,
-                    "X-Tenant-Id": val,
-                }
-            )
-    except Exception:
-        pass
+    if scope_id:
+        headers.update(
+            {
+                "X-Team-Id": scope_id,
+                "X-Company-Id": scope_id,
+                "X-Org-Id": scope_id,
+            }
+        )
 
-    return hdrs
+    return headers
 
 def _coerce_online(value: Union[str, int, float, bool, None]) -> bool:
     # Accept real booleans and 0/1 first
@@ -368,17 +409,21 @@ class BoomNowHttpProvider(DeviceStatusProvider):
         if not BASE_URL:
             raise RuntimeError("BOOMNOW_BASE_URL must be set for boomnow_http provider")
 
-        def _with_q(ep: str, q: str) -> str:
-            base = f"{BASE_URL}{ep}"
-            if q:
-                base += ("&" if "?" in base else "?") + q
-            return base
-
         query = DEVICES_QUERY or "size=100"
+
+        def _build(ep: str) -> str:
+            url = f"{BASE_URL}{ep}"
+            if query:
+                sep = "&" if "?" in url else "?"
+                url = f"{url}{sep}{query}"
+            return url
+
         candidates = [
-            _with_q(DEVICES_ENDPOINT, query),
-            _with_q("/api/iot-devices", query),
-            _with_q("/api/all", query),
+            _build(DEVICES_ENDPOINT),
+            _build("/api/all"),
+            _build("/api/devices"),
+            _build("/api/locks"),
+            _build("/api/iot-devices"),
         ]
 
         headers = dict(DEFAULT_HEADERS)
@@ -406,12 +451,14 @@ class BoomNowHttpProvider(DeviceStatusProvider):
         last_url: Optional[str] = None
         response: Optional[requests.Response] = None
 
-        attempts = 0
-        for url in candidates:
-            if attempts >= MAX_CANDIDATE_ATTEMPTS:
-                break
-            attempts += 1
+        tries = 0
+        idx = 0
+        while idx < len(candidates) and tries < MAX_TRIES:
+            url = candidates[idx]
+            idx += 1
+            tries += 1
             last_url = url
+
             try:
                 assert session is not None
                 response = session.get(url, headers=headers, timeout=_timeout())
@@ -436,6 +483,16 @@ class BoomNowHttpProvider(DeviceStatusProvider):
             items = _extract_device_dicts(payload)
             if items:
                 break
+
+            if (
+                "X-Team-Id" in headers
+                and "tenantId" not in url
+                and tries < MAX_TRIES
+            ):
+                sep = "&" if "?" in url else "?"
+                scoped_url = f"{url}{sep}tenantId={headers['X-Team-Id']}"
+                if scoped_url not in candidates:
+                    candidates.append(scoped_url)
 
         if payload is None:
             ct = response.headers.get("content-type") if response is not None else None
