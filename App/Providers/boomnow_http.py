@@ -158,6 +158,35 @@ def _extract_device_dicts(payload: Any) -> List[Dict[str, Any]]:
     if items is None:
         items = _find_first_list_of_devices(payload) or []
 
+    # If the detected container is a dict that wraps an "edges" array (GraphQL),
+    # unwrap it before continuing so the downstream normalization sees the
+    # individual device dictionaries.
+    if isinstance(items, dict):
+        if isinstance(items.get("edges"), list):
+            items = items["edges"]
+        else:
+            nested = _find_first_list_of_devices(items)
+            items = nested if nested is not None else []
+
+    if isinstance(items, list) and items:
+        # Flatten GraphQL style containers (list of objects each with an ``edges`` array)
+        edge_wrappers: List[Dict[str, Any]] = []
+        for entry in items:
+            if not isinstance(entry, dict):
+                continue
+            if isinstance(entry.get("edges"), list):
+                edge_wrappers.extend(x for x in entry["edges"] if isinstance(x, dict))
+                continue
+            devices = entry.get("devices") if isinstance(entry.get("devices"), dict) else None
+            if isinstance(devices, dict) and isinstance(devices.get("edges"), list):
+                edge_wrappers.extend(x for x in devices["edges"] if isinstance(x, dict))
+        if edge_wrappers:
+            items = edge_wrappers
+        elif not any(_looks_like_device_wrapper(it) for it in items):
+            nested = _find_first_list_of_devices(items)
+            if nested is not None:
+                items = nested
+
     if not isinstance(items, list):
         return []
 
@@ -178,6 +207,10 @@ def _coerce_online(value: Union[str, int, float, bool, None]) -> bool:
 
 def _discover_scope_ids(session: requests.Session) -> List[str]:
     """Pull candidate team/org/tenant ids from helper endpoints."""
+    cached = getattr(session, "_boomnow_scope_ids", None)
+    if cached is not None:
+        return list(cached)
+
     hits = []
     for path in ("/api/get-current-user", "/api/teams", "/api/all", "/api/config"):
         try:
@@ -209,7 +242,23 @@ def _discover_scope_ids(session: requests.Session) -> List[str]:
     for h in hits:
         if h not in seen:
             seen.add(h); out.append(h)
-    return out[:6]  # keep it tight
+    out = out[:6]  # keep it tight
+    setattr(session, "_boomnow_scope_ids", list(out))
+    return out
+
+def _discover_scope_headers(session: requests.Session) -> Dict[str, str]:
+    """Return scoped headers inferred from helper endpoints.
+
+    Tests monkeypatch this helper, so keep it factored for flexibility.
+    """
+    headers: Dict[str, str] = {}
+    ids = _discover_scope_ids(session)
+    preferred = next((sid for sid in ids if sid), None)
+    if preferred:
+        for name in SCOPE_HEADER_NAMES:
+            headers[name] = preferred
+    headers.setdefault("X-Requested-With", "XMLHttpRequest")
+    return headers
 
 def _enumerate_array_paths(o: Any, prefix: str = "") -> List[str]:
     paths = []
@@ -239,6 +288,7 @@ class BoomNowHttpProvider(DeviceStatusProvider):
 
         # Auth: API key or programmatic login
         session = requests.Session()
+        headers.setdefault("X-Requested-With", "XMLHttpRequest")
         session.headers.update(headers)
 
         if API_KEY:
@@ -269,6 +319,7 @@ class BoomNowHttpProvider(DeviceStatusProvider):
                 p.raise_for_status()
 
         # Discover scoping ids (team/org/tenant/company) to try
+        session.headers.update(_discover_scope_headers(session))
         ids = _discover_scope_ids(session)
 
         # Build endpoint + query candidates
