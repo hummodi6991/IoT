@@ -1,5 +1,5 @@
 import os, re, json, requests
-from typing import List, Union, Any, Dict, Iterable, Tuple
+from typing import List, Union, Any, Dict, Tuple
 from urllib.parse import urlencode
 from app.device import Device
 from .base import DeviceStatusProvider
@@ -12,13 +12,13 @@ DEVICES_ENDPOINT = os.environ.get("BOOMNOW_DEVICES_ENDPOINT", "/api/devices")
 DEVICES_JSON_PATH = (os.environ.get("BOOMNOW_DEVICES_JSON_PATH") or "").strip()
 DEVICES_QUERY = (os.environ.get("BOOMNOW_DEVICES_QUERY") or "").lstrip("?")
 EXTRA_HEADERS = os.environ.get("BOOMNOW_EXTRA_HEADERS")  # JSON dict, optional
-EXACT_URL = (os.environ.get("BOOMNOW_EXACT_DEVICES_URL") or "").strip()
 DEBUG_PROVIDER = (os.environ.get("DEBUG_PROVIDER", "0") == "1")
-# Optional deep diagnostics (0/1/2). If DEBUG_PROVIDER is "2", we print more detail.
+# 0/1/2 where 2 prints deep diagnostics
 try:
     DEBUG_LEVEL = int(os.environ.get("DEBUG_PROVIDER", "0"))
 except Exception:
     DEBUG_LEVEL = 1 if DEBUG_PROVIDER else 0
+EXACT_URL = (os.environ.get("BOOMNOW_EXACT_DEVICES_URL") or "").strip()
 
 # Auth
 API_KEY = os.environ.get("BOOMNOW_API_KEY")
@@ -216,7 +216,7 @@ def _coerce_online(value: Union[str, int, float, bool, None]) -> bool:
     return bool(value)
 
 def _discover_scope_ids(session: requests.Session) -> List[str]:
-    """Pull candidate team/org/tenant ids from helper endpoints."""
+    """Return numeric/uuid IDs only (ignore team/org *names*)."""
     cached = getattr(session, "_boomnow_scope_ids", None)
     if cached is not None:
         return list(cached)
@@ -238,10 +238,13 @@ def _discover_scope_ids(session: requests.Session) -> List[str]:
                         walk(v, key_path)
                 else:
                     key_l = key_path.lower()
-                    if isinstance(x, str) and (UUID_RE.match(x) or ("team" in key_l or "tenant" in key_l or "org" in key_l or "company" in key_l)):
-                        hits.append(x)
-                    elif isinstance(x, int) and ("team" in key_l or "tenant" in key_l or "org" in key_l or "company" in key_l):
+                    if isinstance(x, int) and ("team" in key_l or "tenant" in key_l or "org" in key_l or "company" in key_l):
                         hits.append(str(x))
+                    elif isinstance(x, str):
+                        if x.isdigit() and ("team" in key_l or "tenant" in key_l or "org" in key_l or "company" in key_l):
+                            hits.append(x)
+                        elif UUID_RE.match(x):
+                            hits.append(x)
 
             walk(data)
         except Exception:
@@ -270,25 +273,6 @@ def _discover_scope_headers(session: requests.Session) -> Dict[str, str]:
     headers.setdefault("X-Requested-With", "XMLHttpRequest")
     return headers
 
-def _enumerate_array_paths(o: Any, prefix: str = "") -> List[str]:
-    paths = []
-    if isinstance(o, list):
-        if o and all(isinstance(x, dict) for x in o):
-            paths.append(prefix or "$")
-        for i, v in enumerate(o[:3]):
-            paths += _enumerate_array_paths(v, f"{prefix}[{i}]" if prefix else f"[{i}]")
-    elif isinstance(o, dict):
-        for k, v in o.items():
-            paths += _enumerate_array_paths(v, f"{prefix}.{k}" if prefix else k)
-    return paths
-
-def _summarize_scope_headers(h: Dict[str, str]) -> str:
-    keys = []
-    for k in ("X-Team-Id","X-Org-Id","X-Organization-Id","X-Company-Id","X-Tenant-Id"):
-        if k in h:
-            keys.append(f"{k}={h[k]}")
-    return "|".join(keys) or "(none)"
-
 # --------------------
 # Provider
 # --------------------
@@ -313,15 +297,25 @@ class BoomNowHttpProvider(DeviceStatusProvider):
             if not (LOGIN_URL and EMAIL and PASSWORD):
                 raise RuntimeError("BOOMNOW_LOGIN_URL/EMAIL/PASSWORD must be set when no API key is used")
             if LOGIN_KIND == "json":
+                # JSON login
                 resp = session.post(LOGIN_URL, json={"email": EMAIL, "password": PASSWORD},
                                     timeout=REQ_TIMEOUT, allow_redirects=True)
                 resp.raise_for_status()
-                # optional token in JSON responses
                 ok, data = _safe_json(resp)
                 if ok and isinstance(data, dict):
                     token = data.get("token") or data.get("jwt") or data.get("access_token") or data.get("apiKey")
                     if token:
                         session.headers["Authorization"] = f"Bearer {token}"
+                # Warm up to set UI-like cookies / tenant context
+                try:
+                    session.get(f"{BASE_URL}/dashboard/iot", headers={"Referer": f"{BASE_URL}/"}, timeout=REQ_TIMEOUT)
+                    for p in ("/api/get-current-user", "/api/teams", "/api/config"):
+                        try:
+                            session.get(f"{BASE_URL}{p}", timeout=REQ_TIMEOUT)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
             else:
                 g = session.get(LOGIN_URL, timeout=REQ_TIMEOUT)
                 g.raise_for_status()
@@ -333,6 +327,11 @@ class BoomNowHttpProvider(DeviceStatusProvider):
                 headers2 = {"Referer": LOGIN_URL, "Origin": BASE_URL or LOGIN_URL.split("/api")[0]}
                 p = session.post(LOGIN_URL, data=form, headers=headers2, timeout=REQ_TIMEOUT, allow_redirects=True)
                 p.raise_for_status()
+
+        # Diagnostics: cookie names (values redacted)
+        if DEBUG_LEVEL >= 1:
+            cookie_names = sorted(session.cookies.get_dict().keys())
+            print("[diag] cookies=" + ",".join(cookie_names))
 
         # Discover scoping ids (team/org/tenant/company) to try
         session.headers.update(_discover_scope_headers(session))
@@ -348,6 +347,8 @@ class BoomNowHttpProvider(DeviceStatusProvider):
         endpoints = []
         if EXACT_URL:
             endpoints = [EXACT_URL]
+            if DEBUG_LEVEL >= 1:
+                print(f"[diag] exact_url={EXACT_URL}")
         else:
             for ep in ENDPOINT_CANDIDATES:
                 u = _build(ep)
@@ -391,7 +392,12 @@ class BoomNowHttpProvider(DeviceStatusProvider):
                     r = session.get(full_url, headers=hv, timeout=REQ_TIMEOUT)
                     ct = r.headers.get("content-type")
                     if DEBUG_PROVIDER:
-                        print(f"[provider] try[{attempt}] {full_url} => {r.status_code} ct={ct} hdrs={_summarize_scope_headers(hv)}")
+                        scope_bits = []
+                        for k in ("X-Team-Id","X-Org-Id","X-Organization-Id","X-Company-Id","X-Tenant-Id"):
+                            if k in hv:
+                                scope_bits.append(f"{k}={hv[k]}")
+                        hb = "|".join(scope_bits) or "(none)"
+                        print(f"[provider] try[{attempt}] {full_url} => {r.status_code} ct={ct} hdrs={hb}")
 
                     if r.status_code != 200:
                         continue
@@ -408,17 +414,20 @@ class BoomNowHttpProvider(DeviceStatusProvider):
                     if DEBUG_PROVIDER:
                         top = list(payload.keys())[:10] if isinstance(payload, dict) else [type(payload).__name__]
                         print(f"[provider] top_keys={top} items_count={len(items)}")
-                        if not items and DEBUG_LEVEL >= 2:
+                        if DEBUG_LEVEL >= 2:
                             try:
-                                cand_paths = _enumerate_array_paths(payload)
-                                if cand_paths:
-                                    print(f"[diag] array_candidates (first 12): {cand_paths[:12]}")
-                                # Emit a small redacted JSON preview
+                                if isinstance(payload, dict) and isinstance(payload.get("list"), dict):
+                                    lst = payload["list"]
+                                    summary = {
+                                        "list_keys": list(lst.keys())[:10],
+                                        "content_len": len(lst.get("content") or []),
+                                        "totalElements": lst.get("totalElements"),
+                                        "page": lst.get("pageNumber") or lst.get("number"),
+                                    }
+                                    print(f"[diag] list_summary={summary}")
                                 print(f"[diag] payload_snippet={json.dumps(payload)[:1200]}")
                             except Exception:
                                 pass
-                        elif items and DEBUG_LEVEL >= 2:
-                            print(f"[diag] sample_item_keys={list(items[0].keys())[:12]}")
                     if items:
                         break
                 if items:
@@ -441,7 +450,12 @@ class BoomNowHttpProvider(DeviceStatusProvider):
                     r = session.get(full_url, headers=session.headers, timeout=REQ_TIMEOUT)
                     ct = r.headers.get("content-type")
                     if DEBUG_PROVIDER:
-                        print(f"[provider] try[{attempt}] {full_url} => {r.status_code} ct={ct} hdrs={_summarize_scope_headers(session.headers)}")
+                        scope_bits = []
+                        for k in ("X-Team-Id","X-Org-Id","X-Organization-Id","X-Company-Id","X-Tenant-Id"):
+                            if k in session.headers:
+                                scope_bits.append(f"{k}={session.headers[k]}")
+                        hb = "|".join(scope_bits) or "(none)"
+                        print(f"[provider] try[{attempt}] {full_url} => {r.status_code} ct={ct} hdrs={hb}")
                     if r.status_code != 200:
                         continue
                     is_json, payload = _safe_json(r)
@@ -454,16 +468,20 @@ class BoomNowHttpProvider(DeviceStatusProvider):
                     if DEBUG_PROVIDER:
                         top = list(payload.keys())[:10] if isinstance(payload, dict) else [type(payload).__name__]
                         print(f"[provider] top_keys={top} items_count={len(items)}")
-                        if not items and DEBUG_LEVEL >= 2:
+                        if DEBUG_LEVEL >= 2:
                             try:
-                                cand_paths = _enumerate_array_paths(payload)
-                                if cand_paths:
-                                    print(f"[diag] array_candidates (first 12): {cand_paths[:12]}")
+                                if isinstance(payload, dict) and isinstance(payload.get("list"), dict):
+                                    lst = payload["list"]
+                                    summary = {
+                                        "list_keys": list(lst.keys())[:10],
+                                        "content_len": len(lst.get("content") or []),
+                                        "totalElements": lst.get("totalElements"),
+                                        "page": lst.get("pageNumber") or lst.get("number"),
+                                    }
+                                    print(f"[diag] list_summary={summary}")
                                 print(f"[diag] payload_snippet={json.dumps(payload)[:1200]}")
                             except Exception:
                                 pass
-                        elif items and DEBUG_LEVEL >= 2:
-                            print(f"[diag] sample_item_keys={list(items[0].keys())[:12]}")
                     if items:
                         break
                 if items:
