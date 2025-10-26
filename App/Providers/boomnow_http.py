@@ -12,6 +12,7 @@ DEVICES_ENDPOINT = os.environ.get("BOOMNOW_DEVICES_ENDPOINT", "/api/devices")
 DEVICES_JSON_PATH = (os.environ.get("BOOMNOW_DEVICES_JSON_PATH") or "").strip()
 DEVICES_QUERY = (os.environ.get("BOOMNOW_DEVICES_QUERY") or "").lstrip("?")
 EXTRA_HEADERS = os.environ.get("BOOMNOW_EXTRA_HEADERS")  # JSON dict, optional
+EXACT_URL = (os.environ.get("BOOMNOW_EXACT_DEVICES_URL") or "").strip()
 DEBUG_PROVIDER = (os.environ.get("DEBUG_PROVIDER", "0") == "1")
 # Optional deep diagnostics (0/1/2). If DEBUG_PROVIDER is "2", we print more detail.
 try:
@@ -345,10 +346,13 @@ class BoomNowHttpProvider(DeviceStatusProvider):
             return _join_query(u, q) if q else u
 
         endpoints = []
-        for ep in ENDPOINT_CANDIDATES:
-            u = _build(ep)
-            if u not in endpoints:
-                endpoints.append(u)
+        if EXACT_URL:
+            endpoints = [EXACT_URL]
+        else:
+            for ep in ENDPOINT_CANDIDATES:
+                u = _build(ep)
+                if u not in endpoints:
+                    endpoints.append(u)
 
         # Compact query variants; we'll try header scoping first, then add query scoping if needed.
         base_query_only = [""]
