@@ -38,6 +38,7 @@ jobs:
           BOOMNOW_DEVICES_JSON_PATH: ${{ vars.BOOMNOW_DEVICES_JSON_PATH }}   # e.g. list.items
           BOOMNOW_DEVICES_QUERY: ${{ vars.BOOMNOW_DEVICES_QUERY }}           # e.g. perPage=100&page=1
           BOOMNOW_EXTRA_HEADERS: ${{ vars.BOOMNOW_EXTRA_HEADERS }}           # optional org/tenant header
+          BOOMNOW_EXACT_DEVICES_URL: ${{ vars.BOOMNOW_EXACT_DEVICES_URL }}   # optional exact URL override
           DEBUG_PROVIDER: ${{ vars.DEBUG_PROVIDER }}                         # set 1 for one run
           STRICT_EMAIL: ${{ vars.STRICT_EMAIL }}                             # optional
 
