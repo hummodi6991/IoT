@@ -19,6 +19,7 @@ try:
 except Exception:
     DEBUG_LEVEL = 1 if DEBUG_PROVIDER else 0
 EXACT_DEVICES_URL = (os.environ.get("BOOMNOW_EXACT_DEVICES_URL") or "").strip()
+SESSION_COOKIE = (os.environ.get("BOOMNOW_SESSION_COOKIE") or "").strip()
 
 # Auth
 API_KEY = os.environ.get("BOOMNOW_API_KEY")
@@ -64,6 +65,33 @@ UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]
 # --------------------
 # Utilities
 # --------------------
+def _shape_of(x: Any) -> str:
+    try:
+        if isinstance(x, dict):
+            keys = list(x.keys())[:10]
+            return f"{keys}"
+        if isinstance(x, list):
+            sample = x[:1]
+            return f"[len={len(x)}, sample_keys={list(sample[0].keys()) if sample and isinstance(sample[0], dict) else '[]'}]"
+        return type(x).__name__
+    except Exception:
+        return type(x).__name__
+
+def _extract_embedded_json(html: str) -> Any:
+    # Next.js
+    m = re.search(r'__NEXT_DATA__"\s*type="application/json">\s*({.*?})\s*</script>', html, re.S)
+    if m:
+        return json.loads(m.group(1))
+    # Nuxt
+    m = re.search(r'window\.__NUXT__\s*=\s*({.*?});', html, re.S)
+    if m:
+        return json.loads(m.group(1))
+    # Generic
+    m = re.search(r'window\.__INITIAL_STATE__\s*=\s*({.*?});', html, re.S)
+    if m:
+        return json.loads(m.group(1))
+    return None
+
 def _extract_csrf(html: str):
     m = re.search(r'<meta[^>]+name=["\']csrf-token["\'][^>]+content=["\']([^"\']+)["\']', html, re.I)
     if m: return m.group(1)
@@ -254,6 +282,26 @@ def _extract_device_dicts(payload: Any) -> List[Dict[str, Any]]:
             out.append(_unwrap_device_dict(it))
     return out
 
+def _html_devices_fallback(session: requests.Session) -> List[Dict[str, Any]]:
+    """Try to scrape device list from dashboard HTML if API returns empty."""
+    try:
+        r = session.get(f"{BASE_URL}/dashboard/iot", timeout=REQ_TIMEOUT)
+        if DEBUG_LEVEL >= 1:
+            print(f"[diag] dashboard/iot => {r.status_code} ct={r.headers.get('content-type')}")
+        if r.status_code != 200 or "text/html" not in (r.headers.get("content-type") or ""):
+            return []
+        data = _extract_embedded_json(r.text or "")
+        if not data:
+            return []
+        items = _extract_device_dicts(data)
+        if DEBUG_LEVEL >= 1:
+            print(f"[diag] html_fallback items={len(items)} shape={_shape_of(items)}")
+        return items if isinstance(items, list) else []
+    except Exception as e:
+        if DEBUG_LEVEL >= 1:
+            print(f"[diag] html_fallback error={e}")
+        return []
+
 def _coerce_online(value: Union[str, int, float, bool, None]) -> bool:
     if isinstance(value, bool): return value
     if isinstance(value, (int, float)): return value != 0
@@ -339,46 +387,87 @@ class BoomNowHttpProvider(DeviceStatusProvider):
         session = requests.Session()
         session.headers.update(headers)
 
+        if SESSION_COOKIE:
+            session.cookies.set(
+                "_designedvr_dahsboard_session",
+                SESSION_COOKIE,
+                domain="app.boomnow.com",
+                path="/",
+            )
+            if DEBUG_LEVEL >= 1:
+                print("[diag] injected session cookie=_designedvr_dahsboard_session")
+
         if API_KEY:
             session.headers["Authorization"] = f"Bearer {API_KEY}"
         else:
             if not (LOGIN_URL and EMAIL and PASSWORD):
                 raise RuntimeError("BOOMNOW_LOGIN_URL/EMAIL/PASSWORD must be set when no API key is used")
             if LOGIN_KIND == "json":
-                # JSON login
-                resp = session.post(LOGIN_URL, json={"email": EMAIL, "password": PASSWORD},
-                                    timeout=REQ_TIMEOUT, allow_redirects=True)
-                resp.raise_for_status()
-                ok, data = _safe_json(resp)
-                if ok and isinstance(data, dict):
-                    token = data.get("token") or data.get("jwt") or data.get("access_token") or data.get("apiKey")
-                    if token:
-                        session.headers["Authorization"] = f"Bearer {token}"
-                # Warm-up: load the dashboard once so the server sets tenant context in cookies
                 try:
-                    session.get(
-                        f"{BASE_URL}/dashboard/iot",
-                        headers={"Referer": f"{BASE_URL}/"},
+                    resp = session.post(
+                        LOGIN_URL,
+                        json={"email": EMAIL, "password": PASSWORD},
                         timeout=REQ_TIMEOUT,
+                        allow_redirects=True,
                     )
-                except Exception:
-                    pass
-            else:
+                    if DEBUG_LEVEL >= 1:
+                        print(
+                            f"[diag] json_login status={resp.status_code} set_cookie={bool(resp.headers.get('set-cookie'))}"
+                        )
+                    resp.raise_for_status()
+                    ok, data = _safe_json(resp)
+                    if ok and isinstance(data, dict):
+                        token = (
+                            data.get("token")
+                            or data.get("jwt")
+                            or data.get("access_token")
+                            or data.get("apiKey")
+                        )
+                        if token:
+                            session.headers["Authorization"] = f"Bearer {token}"
+                except Exception as e:
+                    if DEBUG_LEVEL >= 1:
+                        print(f"[diag] json_login failed: {e}")
+            try:
                 g = session.get(LOGIN_URL, timeout=REQ_TIMEOUT)
                 g.raise_for_status()
                 csrf = _extract_csrf(getattr(g, "text", "") or "")
                 form = {"email": EMAIL, "password": PASSWORD}
                 if re.search(r'name=["\']user\[email\]["\']', getattr(g, "text", "") or "", re.I):
                     form = {"user[email]": EMAIL, "user[password]": PASSWORD}
-                if csrf: form["authenticity_token"] = csrf
+                if csrf:
+                    form["authenticity_token"] = csrf
                 headers2 = {"Referer": LOGIN_URL, "Origin": BASE_URL or LOGIN_URL.split("/api")[0]}
-                p = session.post(LOGIN_URL, data=form, headers=headers2, timeout=REQ_TIMEOUT, allow_redirects=True)
+                p = session.post(
+                    LOGIN_URL,
+                    data=form,
+                    headers=headers2,
+                    timeout=REQ_TIMEOUT,
+                    allow_redirects=True,
+                )
+                if DEBUG_LEVEL >= 1:
+                    print(
+                        f"[diag] form_login status={p.status_code} set_cookie={bool(p.headers.get('set-cookie'))}"
+                    )
                 p.raise_for_status()
+            except Exception as e:
+                if DEBUG_LEVEL >= 1:
+                    print(f"[diag] form_login failed: {e}")
 
         # Diagnostics: cookie names (values redacted)
         if DEBUG_LEVEL >= 1:
             cookie_names = sorted(session.cookies.get_dict().keys())
             print("[diag] cookies=" + ",".join(cookie_names))
+
+            try:
+                me = session.get(f"{BASE_URL}/api/get-current-user", timeout=REQ_TIMEOUT)
+                ok, me_json = _safe_json(me)
+                keys = list(me_json.keys())[:8] if isinstance(me_json, dict) else type(me_json).__name__
+                print(
+                    f"[diag] whoami status={me.status_code} ok={ok} keys={keys}"
+                )
+            except Exception as e:
+                print(f"[diag] whoami failed: {e}")
 
         # IMPORTANT: BoomNow uses cookie context. Do NOT send X-* scope headers/queries.
         ids: List[str] = []  # disable id-scoping entirely (header + query)
@@ -546,6 +635,11 @@ class BoomNowHttpProvider(DeviceStatusProvider):
         if found_payload is None:
             # We keep returning empty list so monitor doesn't crash; diagnostics already printed.
             return []
+
+        if not items:
+            html_items = _html_devices_fallback(session)
+            if html_items:
+                items = html_items
 
         # Normalize to Device objects
         out: List[Device] = []
