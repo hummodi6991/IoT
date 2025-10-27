@@ -306,14 +306,13 @@ class BoomNowHttpProvider(DeviceStatusProvider):
                     token = data.get("token") or data.get("jwt") or data.get("access_token") or data.get("apiKey")
                     if token:
                         session.headers["Authorization"] = f"Bearer {token}"
-                # Warm up to set UI-like cookies / tenant context
+                # Warm-up: load the dashboard once so the server sets tenant context in cookies
                 try:
-                    session.get(f"{BASE_URL}/dashboard/iot", headers={"Referer": f"{BASE_URL}/"}, timeout=REQ_TIMEOUT)
-                    for p in ("/api/get-current-user", "/api/teams", "/api/config"):
-                        try:
-                            session.get(f"{BASE_URL}{p}", timeout=REQ_TIMEOUT)
-                        except Exception:
-                            pass
+                    session.get(
+                        f"{BASE_URL}/dashboard/iot",
+                        headers={"Referer": f"{BASE_URL}/"},
+                        timeout=REQ_TIMEOUT,
+                    )
                 except Exception:
                     pass
             else:
@@ -333,9 +332,8 @@ class BoomNowHttpProvider(DeviceStatusProvider):
             cookie_names = sorted(session.cookies.get_dict().keys())
             print("[diag] cookies=" + ",".join(cookie_names))
 
-        # Discover scoping ids (team/org/tenant/company) to try
-        session.headers.update(_discover_scope_headers(session))
-        ids = _discover_scope_ids(session)
+        # IMPORTANT: BoomNow uses cookie context. Do NOT send X-* scope headers/queries.
+        ids: List[str] = []  # disable id-scoping entirely (header + query)
 
         # Build endpoint + query candidates
         def _build(ep: str) -> str:
@@ -357,18 +355,12 @@ class BoomNowHttpProvider(DeviceStatusProvider):
 
         # Compact query variants; we'll try header scoping first, then add query scoping if needed.
         base_query_only = [""]
-        scoped_query = []
-        for sid in ids:
-            for pname in SCOPE_QUERY_NAMES:
-                scoped_query.append(f"{pname}={sid}")
+        scoped_query: List[str] = []
 
-        # Header variants: try each discovered id across common header names.
-        header_variants = [dict(session.headers)]
-        for sid in ids:
-            for hname in SCOPE_HEADER_NAMES:
-                hv = dict(session.headers)
-                hv[hname] = sid
-                header_variants.append(hv)
+        # Header variants: only sanitized base headers (no scope ids)
+        # Strip any stray X-* scope headers; keep only normal headers
+        base_hv = {k: v for (k, v) in session.headers.items() if k not in SCOPE_HEADER_NAMES}
+        header_variants = [base_hv]
 
         # Sweep attempts (bounded)
         tried = set()
@@ -414,20 +406,21 @@ class BoomNowHttpProvider(DeviceStatusProvider):
                     if DEBUG_PROVIDER:
                         top = list(payload.keys())[:10] if isinstance(payload, dict) else [type(payload).__name__]
                         print(f"[provider] top_keys={top} items_count={len(items)}")
-                        if DEBUG_LEVEL >= 2:
-                            try:
-                                if isinstance(payload, dict) and isinstance(payload.get("list"), dict):
-                                    lst = payload["list"]
-                                    summary = {
-                                        "list_keys": list(lst.keys())[:10],
-                                        "content_len": len(lst.get("content") or []),
-                                        "totalElements": lst.get("totalElements"),
-                                        "page": lst.get("pageNumber") or lst.get("number"),
-                                    }
-                                    print(f"[diag] list_summary={summary}")
+                        # Print a short page summary to see real counts
+                        try:
+                            if isinstance(payload, dict) and isinstance(payload.get("list"), dict):
+                                lst = payload["list"]
+                                summary = {
+                                    "list_keys": list(lst.keys())[:10],
+                                    "content_len": len(lst.get("content") or []),
+                                    "totalElements": lst.get("totalElements"),
+                                    "page": lst.get("pageNumber") or lst.get("number"),
+                                }
+                                print(f"[diag] list_summary={summary}")
+                            if DEBUG_LEVEL >= 2:
                                 print(f"[diag] payload_snippet={json.dumps(payload)[:1200]}")
-                            except Exception:
-                                pass
+                        except Exception:
+                            pass
                     if items:
                         break
                 if items:
@@ -447,13 +440,13 @@ class BoomNowHttpProvider(DeviceStatusProvider):
                         continue
                     tried.add(key)
                     attempt += 1
-                    r = session.get(full_url, headers=session.headers, timeout=REQ_TIMEOUT)
+                    r = session.get(full_url, headers=base_hv, timeout=REQ_TIMEOUT)
                     ct = r.headers.get("content-type")
                     if DEBUG_PROVIDER:
                         scope_bits = []
                         for k in ("X-Team-Id","X-Org-Id","X-Organization-Id","X-Company-Id","X-Tenant-Id"):
-                            if k in session.headers:
-                                scope_bits.append(f"{k}={session.headers[k]}")
+                            if k in base_hv:
+                                scope_bits.append(f"{k}={base_hv[k]}")
                         hb = "|".join(scope_bits) or "(none)"
                         print(f"[provider] try[{attempt}] {full_url} => {r.status_code} ct={ct} hdrs={hb}")
                     if r.status_code != 200:
@@ -468,20 +461,21 @@ class BoomNowHttpProvider(DeviceStatusProvider):
                     if DEBUG_PROVIDER:
                         top = list(payload.keys())[:10] if isinstance(payload, dict) else [type(payload).__name__]
                         print(f"[provider] top_keys={top} items_count={len(items)}")
-                        if DEBUG_LEVEL >= 2:
-                            try:
-                                if isinstance(payload, dict) and isinstance(payload.get("list"), dict):
-                                    lst = payload["list"]
-                                    summary = {
-                                        "list_keys": list(lst.keys())[:10],
-                                        "content_len": len(lst.get("content") or []),
-                                        "totalElements": lst.get("totalElements"),
-                                        "page": lst.get("pageNumber") or lst.get("number"),
-                                    }
-                                    print(f"[diag] list_summary={summary}")
+                        # Print a short page summary to see real counts
+                        try:
+                            if isinstance(payload, dict) and isinstance(payload.get("list"), dict):
+                                lst = payload["list"]
+                                summary = {
+                                    "list_keys": list(lst.keys())[:10],
+                                    "content_len": len(lst.get("content") or []),
+                                    "totalElements": lst.get("totalElements"),
+                                    "page": lst.get("pageNumber") or lst.get("number"),
+                                }
+                                print(f"[diag] list_summary={summary}")
+                            if DEBUG_LEVEL >= 2:
                                 print(f"[diag] payload_snippet={json.dumps(payload)[:1200]}")
-                            except Exception:
-                                pass
+                        except Exception:
+                            pass
                     if items:
                         break
                 if items:
