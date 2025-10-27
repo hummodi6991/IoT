@@ -41,6 +41,11 @@ jobs:
           BOOMNOW_EXACT_DEVICES_URL: ${{ vars.BOOMNOW_EXACT_DEVICES_URL }}   # optional exact URL override
           DEBUG_PROVIDER: ${{ vars.DEBUG_PROVIDER }}                         # set 1 for one run
           STRICT_EMAIL: ${{ vars.STRICT_EMAIL }}                             # optional
+          # ───────── New knobs (Repository Variables) ─────────
+          SUPPRESS_FIRST_RUN: ${{ vars.SUPPRESS_FIRST_RUN }}                  # '1' to suppress alerts on the very first run
+          ALERT_BATCH_LIMIT: ${{ vars.ALERT_BATCH_LIMIT }}                    # cap number of alerts per run (e.g., 10)
+          BOOMNOW_ONLINE_FIELD: ${{ vars.BOOMNOW_ONLINE_FIELD }}              # optional: override online field name
+          BOOMNOW_NAME_FIELD: ${{ vars.BOOMNOW_NAME_FIELD }}                  # optional: override name field name
 
           # Secrets (credentials)
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
