@@ -321,9 +321,9 @@ def _extract_device_dicts(payload: Any) -> List[Dict[str, Any]]:
 
 def _coerce_online(value: Union[str, int, float, bool, None, Dict[str, Any]]) -> Any:
     """
-    Convert heterogeneous "online" signals to True/False.
-    IMPORTANT: unknown / not-present must return None (NOT False),
-    otherwise every device without a recognized field is treated as offline.
+    Convert heterogeneous "online" signals to True/False/None.
+    IMPORTANT: unknown / not-present MUST return None (NOT False),
+    otherwise devices without a recognized field get miscounted as offline.
     """
     # Unknown / missing
     if value is None:
@@ -352,15 +352,16 @@ def _coerce_online(value: Union[str, int, float, bool, None, Dict[str, Any]]) ->
         # positive synonyms
         if v in {"true","1","yes","online","up","connected","active","alive","ok","healthy"}:
             return True
-        # negative synonyms (and the UI text we observed)
-        if v in {"false","0","no","offline","down","inactive","disconnected",
-                 "no data","unknown","n/a","na","not available","none","null","—","-",
-                 "red","danger","error"}:
+        # definite negatives (UI/indicator words)
+        if v in {"false","0","no","offline","down","inactive","disconnected","red","danger","error"}:
             return False
-        # Common color/label heuristics
+        # common color/label heuristics for positives
         if v in {"green","success"}:
             return True
-        # Unrecognized string – don't guess
+        # ambiguous: treat as unknown (not offline)
+        if v in {"no data","unknown","n/a","na","not available","none","null","—","-"}:
+            return None
+        # anything else – don't guess
         return None
 
     # Any other type – unknown
@@ -843,41 +844,37 @@ class BoomNowHttpProvider(DeviceStatusProvider):
             if NAME_FIELD:
                 name = _get_by_path(item, NAME_FIELD) or name
 
-            # Preserve explicit False; do not use 'or' chains here.
-            online_raw = _first_present(
-                item,
-                "online", "isOnline", "connected", "is_online", "onlineStatus"
-            )
-            if online_raw is None:
-                # try common variants for listing-devices
-                online_raw = _first_present(
-                    item,
-                    "isConnected", "connectionStatus", "online_status", "onlineText"
-                )
-            # Use explicit override, else the auto-detected path, if either yields a value.
+            # Choose the best online signal with a *preference* for the UI indicator.
+            # 1) explicit override via BOOMNOW_ONLINE_FIELD (or auto-detected path)
+            # 2) status.* (color/text/name) and statusColor / indicator fields
+            # 3) simple boolean-ish flags
+            # (NOTE: 'properties.online' is intentionally NOT used by default;
+            #        on this tenant it reflects "activated" not "connected".)
+            candidate_paths: List[str] = []
             chosen_path = ONLINE_FIELD or auto_online_path
             if chosen_path:
-                v = _get_by_path(item, chosen_path)
-                if v is not None:
-                    online_raw = v
-            if online_raw is None and "status" in item:
-                status = item.get("status")
-                if isinstance(status, dict):
-                    online_raw = status.get("name") or status.get("text") or status.get("value") or status.get("color")
-                else:
-                    # Only accept literal device statuses here; ignore generic wrapper values like "success".
-                    if isinstance(status, str) and status.strip().lower() in {
-                        "online","offline","up","down","connected","disconnected","ok","error"
-                    }:
-                        online_raw = status
-            if online_raw is None:
-                indicator = (item.get("statusColor") or item.get("status_color") or
-                             item.get("indicator") or item.get("onlineColor") or item.get("statusDot"))
-                if indicator:
-                    sv = str(indicator).strip().lower()
-                    online_raw = True if sv in {"green","success","ok"} else False if sv in {"red","danger","error"} else None
+                candidate_paths.append(chosen_path)
+            candidate_paths += [
+                "status.color", "statusColor", "status.text", "statusText", "status.name",
+                "status.value", "statusValue", "status.colorName", "status.color_name",
+                "status_color", "indicator", "onlineColor", "statusDot",
+                "online", "isOnline", "connected", "is_connected",
+                "is_online", "onlineStatus", "isConnected", "connectionStatus", "online_status", "onlineText",
+            ]
 
-            online = _coerce_online(online_raw)
+            online = None
+            for path in candidate_paths:
+                if "." in path:
+                    val = _get_by_path(item, path)
+                else:
+                    val = item.get(path)
+                coerced = _coerce_online(val)
+                if coerced is not None:
+                    online = coerced
+                    break
+            # final fallback: if there is a 'status' object or string not covered above
+            if online is None and "status" in item:
+                online = _coerce_online(item.get("status"))
 
             battery = None
             for k in ("battery","batteryPercent","battery_percentage","batteryLevel","battery_level"):
