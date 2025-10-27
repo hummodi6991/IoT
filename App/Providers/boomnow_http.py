@@ -18,7 +18,7 @@ try:
     DEBUG_LEVEL = int(os.environ.get("DEBUG_PROVIDER", "0"))
 except Exception:
     DEBUG_LEVEL = 1 if DEBUG_PROVIDER else 0
-EXACT_URL = (os.environ.get("BOOMNOW_EXACT_DEVICES_URL") or "").strip()
+EXACT_DEVICES_URL = (os.environ.get("BOOMNOW_EXACT_DEVICES_URL") or "").strip()
 
 # Auth
 API_KEY = os.environ.get("BOOMNOW_API_KEY")
@@ -96,6 +96,54 @@ def _get_by_path(obj: Any, path: str):
         else:
             return None
     return cur
+
+# --- new: diagnostics helpers ----
+DEVICE_HINT_KEYS = {
+    "id", "deviceId", "uuid", "lockId", "serialNumber",
+    "name", "deviceName", "label",
+    "online", "isOnline", "connected", "status", "statusText", "statusColor",
+}
+
+def _summarize(o: Any, depth: int = 2, max_items: int = 3) -> Any:
+    """Return a small, printable structural summary (keys/types/sizes) of a JSON object."""
+    if depth < 0:
+        return type(o).__name__
+    if isinstance(o, dict):
+        out = {}
+        for k, v in list(o.items())[:20]:
+            out[k] = _summarize(v, depth - 1, max_items)
+        return out
+    if isinstance(o, list):
+        return {
+            "_type": "list",
+            "len": len(o),
+            "sample": [_summarize(v, depth - 1, max_items) for v in o[:max_items]],
+        }
+    return type(o).__name__
+
+def _score_device_list(lst: list) -> float:
+    if not isinstance(lst, list) or not lst:
+        return 0.0
+    checks = 0
+    for it in lst[: min(20, len(lst))]:
+        if isinstance(it, dict) and any(k in it for k in DEVICE_HINT_KEYS):
+            checks += 1
+    return checks / min(20, len(lst))
+
+def _probe_device_arrays(payload: Any) -> List[Tuple[str, float, int]]:
+    """Return [(json_path, score, length), ...] sorted best-first."""
+    candidates: List[Tuple[str, float, int]] = []
+
+    def walk(node: Any, path: str = "") -> None:
+        if isinstance(node, list):
+            candidates.append((path or "$", _score_device_list(node), len(node)))
+        elif isinstance(node, dict):
+            for k, v in node.items():
+                walk(v, f"{path}.{k}" if path else k)
+
+    walk(payload)
+    candidates.sort(key=lambda t: (-t[1], -t[2]))
+    return candidates
 
 def _looks_like_device_wrapper(d: Any) -> bool:
     return isinstance(d, dict) and any(
@@ -343,10 +391,10 @@ class BoomNowHttpProvider(DeviceStatusProvider):
             return _join_query(u, q) if q else u
 
         endpoints = []
-        if EXACT_URL:
-            endpoints = [EXACT_URL]
+        if EXACT_DEVICES_URL:
+            endpoints = [EXACT_DEVICES_URL]
             if DEBUG_LEVEL >= 1:
-                print(f"[diag] exact_url={EXACT_URL}")
+                print(f"[diag] exact_url={EXACT_DEVICES_URL}")
         else:
             for ep in ENDPOINT_CANDIDATES:
                 u = _build(ep)
@@ -357,10 +405,19 @@ class BoomNowHttpProvider(DeviceStatusProvider):
         base_query_only = [""]
         scoped_query: List[str] = []
 
-        # Header variants: only sanitized base headers (no scope ids)
+        # Header variants: start with discovered scoped headers, then fall back to bare headers
         # Strip any stray X-* scope headers; keep only normal headers
         base_hv = {k: v for (k, v) in session.headers.items() if k not in SCOPE_HEADER_NAMES}
-        header_variants = [base_hv]
+        header_variants: List[Dict[str, str]] = []
+        try:
+            scoped_headers = _discover_scope_headers(session)
+        except Exception:
+            scoped_headers = {}
+        if scoped_headers:
+            hv_scoped = dict(base_hv)
+            hv_scoped.update(scoped_headers)
+            header_variants.append(hv_scoped)
+        header_variants.append(base_hv)
 
         # Sweep attempts (bounded)
         tried = set()
@@ -384,12 +441,12 @@ class BoomNowHttpProvider(DeviceStatusProvider):
                     r = session.get(full_url, headers=hv, timeout=REQ_TIMEOUT)
                     ct = r.headers.get("content-type")
                     if DEBUG_PROVIDER:
-                        scope_bits = []
-                        for k in ("X-Team-Id","X-Org-Id","X-Organization-Id","X-Company-Id","X-Tenant-Id"):
-                            if k in hv:
-                                scope_bits.append(f"{k}={hv[k]}")
-                        hb = "|".join(scope_bits) or "(none)"
-                        print(f"[provider] try[{attempt}] {full_url} => {r.status_code} ct={ct} hdrs={hb}")
+                        scope_parts = []
+                        for k in ("X-Team-Id", "X-Org-Id", "X-Organization-Id", "X-Company-Id", "X-Tenant-Id"):
+                            if hv.get(k):
+                                scope_parts.append(f"{k}={hv[k]}")
+                        hdrs = "|".join(scope_parts) if scope_parts else "(none)"
+                        print(f"[provider] try[{attempt}] {full_url} => {r.status_code} ct={ct} hdrs={hdrs}")
 
                     if r.status_code != 200:
                         continue
@@ -406,21 +463,23 @@ class BoomNowHttpProvider(DeviceStatusProvider):
                     if DEBUG_PROVIDER:
                         top = list(payload.keys())[:10] if isinstance(payload, dict) else [type(payload).__name__]
                         print(f"[provider] top_keys={top} items_count={len(items)}")
-                        # Print a short page summary to see real counts
                         try:
-                            if isinstance(payload, dict) and isinstance(payload.get("list"), dict):
-                                lst = payload["list"]
-                                summary = {
-                                    "list_keys": list(lst.keys())[:10],
-                                    "content_len": len(lst.get("content") or []),
-                                    "totalElements": lst.get("totalElements"),
-                                    "page": lst.get("pageNumber") or lst.get("number"),
-                                }
-                                print(f"[diag] list_summary={summary}")
-                            if DEBUG_LEVEL >= 2:
-                                print(f"[diag] payload_snippet={json.dumps(payload)[:1200]}")
+                            print(f"[diag] payload_shape={json.dumps(_summarize(payload), ensure_ascii=False)[:1000]}")
                         except Exception:
                             pass
+                        if not items:
+                            try:
+                                cands = _probe_device_arrays(payload)
+                                if cands:
+                                    print(f"[diag] device_array_candidates (top 5)={cands[:5]}")
+                                    best_path, score, _len = cands[0]
+                                    if score > 0:
+                                        guessed = payload if best_path == "$" else _get_by_path(payload, best_path)
+                                        if isinstance(guessed, list):
+                                            print(f"[diag] json_path_guess='{best_path}' score={score} count={len(guessed)}")
+                                            items = _extract_device_dicts(guessed)
+                            except Exception:
+                                pass
                     if items:
                         break
                 if items:
@@ -443,12 +502,12 @@ class BoomNowHttpProvider(DeviceStatusProvider):
                     r = session.get(full_url, headers=base_hv, timeout=REQ_TIMEOUT)
                     ct = r.headers.get("content-type")
                     if DEBUG_PROVIDER:
-                        scope_bits = []
-                        for k in ("X-Team-Id","X-Org-Id","X-Organization-Id","X-Company-Id","X-Tenant-Id"):
-                            if k in base_hv:
-                                scope_bits.append(f"{k}={base_hv[k]}")
-                        hb = "|".join(scope_bits) or "(none)"
-                        print(f"[provider] try[{attempt}] {full_url} => {r.status_code} ct={ct} hdrs={hb}")
+                        scope_parts = []
+                        for k in ("X-Team-Id", "X-Org-Id", "X-Organization-Id", "X-Company-Id", "X-Tenant-Id"):
+                            if base_hv.get(k):
+                                scope_parts.append(f"{k}={base_hv[k]}")
+                        hdrs = "|".join(scope_parts) if scope_parts else "(none)"
+                        print(f"[provider] try[{attempt}] {full_url} => {r.status_code} ct={ct} hdrs={hdrs}")
                     if r.status_code != 200:
                         continue
                     is_json, payload = _safe_json(r)
@@ -461,21 +520,23 @@ class BoomNowHttpProvider(DeviceStatusProvider):
                     if DEBUG_PROVIDER:
                         top = list(payload.keys())[:10] if isinstance(payload, dict) else [type(payload).__name__]
                         print(f"[provider] top_keys={top} items_count={len(items)}")
-                        # Print a short page summary to see real counts
                         try:
-                            if isinstance(payload, dict) and isinstance(payload.get("list"), dict):
-                                lst = payload["list"]
-                                summary = {
-                                    "list_keys": list(lst.keys())[:10],
-                                    "content_len": len(lst.get("content") or []),
-                                    "totalElements": lst.get("totalElements"),
-                                    "page": lst.get("pageNumber") or lst.get("number"),
-                                }
-                                print(f"[diag] list_summary={summary}")
-                            if DEBUG_LEVEL >= 2:
-                                print(f"[diag] payload_snippet={json.dumps(payload)[:1200]}")
+                            print(f"[diag] payload_shape={json.dumps(_summarize(payload), ensure_ascii=False)[:1000]}")
                         except Exception:
                             pass
+                        if not items:
+                            try:
+                                cands = _probe_device_arrays(payload)
+                                if cands:
+                                    print(f"[diag] device_array_candidates (top 5)={cands[:5]}")
+                                    best_path, score, _len = cands[0]
+                                    if score > 0:
+                                        guessed = payload if best_path == "$" else _get_by_path(payload, best_path)
+                                        if isinstance(guessed, list):
+                                            print(f"[diag] json_path_guess='{best_path}' score={score} count={len(guessed)}")
+                                            items = _extract_device_dicts(guessed)
+                            except Exception:
+                                pass
                     if items:
                         break
                 if items:
