@@ -505,6 +505,8 @@ class BoomNowHttpProvider(DeviceStatusProvider):
         endpoints: List[str] = []
         if EXACT_URL:
             u = EXACT_URL
+            if not u.startswith("http"):
+                u = f"{BASE_URL}{u}" if u.startswith("/") else f"{BASE_URL}/{u}"
             if DEVICES_QUERY and "?" not in u:
                 u = _join_query(u, DEVICES_QUERY)
             endpoints.append(u)
