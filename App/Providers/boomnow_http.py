@@ -1,5 +1,5 @@
 import os, re, json, requests
-from typing import List, Union, Any, Dict, Tuple
+from typing import List, Union, Any, Dict, Iterable, Tuple
 from urllib.parse import urlencode
 from app.device import Device
 from .base import DeviceStatusProvider
@@ -18,8 +18,10 @@ try:
     DEBUG_LEVEL = int(os.environ.get("DEBUG_PROVIDER", "0"))
 except Exception:
     DEBUG_LEVEL = 1 if DEBUG_PROVIDER else 0
-EXACT_DEVICES_URL = (os.environ.get("BOOMNOW_EXACT_DEVICES_URL") or "").strip()
+EXACT_URL = (os.environ.get("BOOMNOW_EXACT_DEVICES_URL") or "").strip()
 SESSION_COOKIE = (os.environ.get("BOOMNOW_SESSION_COOKIE") or "").strip()
+# dashboard page we can scrape as a last resort
+DASHBOARD_IOT_PATH = os.environ.get("BOOMNOW_DASHBOARD_IOT_PATH", "/dashboard/iot")
 
 # Auth
 API_KEY = os.environ.get("BOOMNOW_API_KEY")
@@ -65,33 +67,6 @@ UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]
 # --------------------
 # Utilities
 # --------------------
-def _shape_of(x: Any) -> str:
-    try:
-        if isinstance(x, dict):
-            keys = list(x.keys())[:10]
-            return f"{keys}"
-        if isinstance(x, list):
-            sample = x[:1]
-            return f"[len={len(x)}, sample_keys={list(sample[0].keys()) if sample and isinstance(sample[0], dict) else '[]'}]"
-        return type(x).__name__
-    except Exception:
-        return type(x).__name__
-
-def _extract_embedded_json(html: str) -> Any:
-    # Next.js
-    m = re.search(r'__NEXT_DATA__"\s*type="application/json">\s*({.*?})\s*</script>', html, re.S)
-    if m:
-        return json.loads(m.group(1))
-    # Nuxt
-    m = re.search(r'window\.__NUXT__\s*=\s*({.*?});', html, re.S)
-    if m:
-        return json.loads(m.group(1))
-    # Generic
-    m = re.search(r'window\.__INITIAL_STATE__\s*=\s*({.*?});', html, re.S)
-    if m:
-        return json.loads(m.group(1))
-    return None
-
 def _extract_csrf(html: str):
     m = re.search(r'<meta[^>]+name=["\']csrf-token["\'][^>]+content=["\']([^"\']+)["\']', html, re.I)
     if m: return m.group(1)
@@ -124,6 +99,56 @@ def _get_by_path(obj: Any, path: str):
         else:
             return None
     return cur
+
+def _enumerate_array_paths(o: Any, prefix: str = "") -> List[str]:
+    paths: List[str] = []
+    if isinstance(o, dict):
+        for k, v in list(o.items())[:50]:
+            paths.extend(_enumerate_array_paths(v, f"{prefix}.{k}" if prefix else k))
+    elif isinstance(o, Iterable) and not isinstance(o, (str, bytes)):
+        paths.append(prefix or "$")
+        for idx, v in enumerate(list(o)[:20]):
+            paths.extend(_enumerate_array_paths(v, f"{prefix}[{idx}]" if prefix else f"[{idx}]"))
+    return paths
+
+def _trim_json_preview(obj: Any, limit=800) -> str:
+    try:
+        s = json.dumps(obj) if not isinstance(obj, str) else obj
+    except Exception:
+        s = str(type(obj))
+    return s[:limit] + ("…" if len(s) > limit else "")
+
+_NEXT_RE = re.compile(r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(\{.*?\})</script>', re.S | re.I)
+_STATE_RE = re.compile(r'window\.__INITIAL_STATE__\s*=\s*(\{.*?\});', re.S | re.I)
+
+def _scrape_dashboard_for_devices(session: requests.Session) -> List[Dict[str, Any]]:
+    """Fallback: fetch dashboard HTML and pull embedded JSON (Next.js/SPA state)."""
+    try:
+        r = session.get(f"{BASE_URL}{DASHBOARD_IOT_PATH}", timeout=REQ_TIMEOUT)
+        if DEBUG_PROVIDER:
+            print(f"[diag] dashboard/iot => {r.status_code} ct={r.headers.get('content-type')}")
+        if r.status_code != 200:
+            return []
+        html = getattr(r, "text", "") or ""
+        m = _NEXT_RE.search(html) or _STATE_RE.search(html)
+        if not m:
+            return []
+        data = json.loads(m.group(1))
+        arr = _find_first_list_of_devices(data) or []
+        if DEBUG_PROVIDER:
+            print(
+                f"[diag] dashboard_extract paths≈{len(_enumerate_array_paths(data))} "
+                f"sample={_trim_json_preview(arr[:2])}"
+            )
+        out: List[Dict[str, Any]] = []
+        for it in arr:
+            if isinstance(it, dict):
+                out.append(_unwrap_device_dict(it))
+        return out
+    except Exception as exc:
+        if DEBUG_PROVIDER:
+            print(f"[diag] dashboard_parse_error={exc}")
+        return []
 
 # --- new: diagnostics helpers ----
 DEVICE_HINT_KEYS = {
@@ -282,26 +307,6 @@ def _extract_device_dicts(payload: Any) -> List[Dict[str, Any]]:
             out.append(_unwrap_device_dict(it))
     return out
 
-def _html_devices_fallback(session: requests.Session) -> List[Dict[str, Any]]:
-    """Try to scrape device list from dashboard HTML if API returns empty."""
-    try:
-        r = session.get(f"{BASE_URL}/dashboard/iot", timeout=REQ_TIMEOUT)
-        if DEBUG_LEVEL >= 1:
-            print(f"[diag] dashboard/iot => {r.status_code} ct={r.headers.get('content-type')}")
-        if r.status_code != 200 or "text/html" not in (r.headers.get("content-type") or ""):
-            return []
-        data = _extract_embedded_json(r.text or "")
-        if not data:
-            return []
-        items = _extract_device_dicts(data)
-        if DEBUG_LEVEL >= 1:
-            print(f"[diag] html_fallback items={len(items)} shape={_shape_of(items)}")
-        return items if isinstance(items, list) else []
-    except Exception as e:
-        if DEBUG_LEVEL >= 1:
-            print(f"[diag] html_fallback error={e}")
-        return []
-
 def _coerce_online(value: Union[str, int, float, bool, None]) -> bool:
     if isinstance(value, bool): return value
     if isinstance(value, (int, float)): return value != 0
@@ -454,22 +459,23 @@ class BoomNowHttpProvider(DeviceStatusProvider):
                 if DEBUG_LEVEL >= 1:
                     print(f"[diag] form_login failed: {e}")
 
-        # ----- verify we're authenticated -----
-        whoami_candidates = ("/api/get-current-user", "/api/me", "/api/current_user")
-        authed = False
-        for path in whoami_candidates:
-            try:
-                r = session.get(f"{BASE_URL}{path}", timeout=REQ_TIMEOUT, allow_redirects=False)
-                if r.status_code == 200:
-                    authed = True
-                    break
-            except Exception:
-                pass
+        if not API_KEY:
+            # ----- verify we're authenticated -----
+            whoami_candidates = ("/api/get-current-user", "/api/me", "/api/current_user")
+            authed = False
+            for path in whoami_candidates:
+                try:
+                    r = session.get(f"{BASE_URL}{path}", timeout=REQ_TIMEOUT, allow_redirects=False)
+                    if r.status_code == 200:
+                        authed = True
+                        break
+                except Exception:
+                    pass
 
-        if not authed:
-            # Fail fast with a clear message (and keep DEBUG_PROVIDER output for context)
-            raise RuntimeError("Authentication failed: login completed but 'whoami' endpoints returned 401/404; "
-                               "check BOOMNOW_LOGIN_URL/LOGIN_KIND/EMAIL/PASSWORD and tenant SSO settings.")
+            if not authed:
+                # Fail fast with a clear message (and keep DEBUG_PROVIDER output for context)
+                raise RuntimeError("Authentication failed: login completed but 'whoami' endpoints returned 401/404; "
+                                   "check BOOMNOW_LOGIN_URL/LOGIN_KIND/EMAIL/PASSWORD and tenant SSO settings.")
 
         # Diagnostics: cookie names (values redacted)
         if DEBUG_LEVEL >= 1:
@@ -496,16 +502,18 @@ class BoomNowHttpProvider(DeviceStatusProvider):
             q = DEVICES_QUERY or "size=100&page=0"
             return _join_query(u, q) if q else u
 
-        endpoints = []
-        if EXACT_DEVICES_URL:
-            endpoints = [EXACT_DEVICES_URL]
-            if DEBUG_LEVEL >= 1:
-                print(f"[diag] exact_url={EXACT_DEVICES_URL}")
-        else:
-            for ep in ENDPOINT_CANDIDATES:
-                u = _build(ep)
-                if u not in endpoints:
-                    endpoints.append(u)
+        endpoints: List[str] = []
+        if EXACT_URL:
+            u = EXACT_URL
+            if DEVICES_QUERY and "?" not in u:
+                u = _join_query(u, DEVICES_QUERY)
+            endpoints.append(u)
+            if DEBUG_PROVIDER:
+                print(f"[diag] exact_url={u}")
+        for ep in ENDPOINT_CANDIDATES:
+            u = _build(ep)
+            if u not in endpoints:
+                endpoints.append(u)
 
         # Compact query variants; we'll try header scoping first, then add query scoping if needed.
         base_query_only = [""]
@@ -547,11 +555,12 @@ class BoomNowHttpProvider(DeviceStatusProvider):
                     r = session.get(full_url, headers=hv, timeout=REQ_TIMEOUT)
                     ct = r.headers.get("content-type")
                     if DEBUG_PROVIDER:
-                        scope_parts = []
-                        for k in ("X-Team-Id", "X-Org-Id", "X-Organization-Id", "X-Company-Id", "X-Tenant-Id"):
-                            if hv.get(k):
-                                scope_parts.append(f"{k}={hv[k]}")
-                        hdrs = "|".join(scope_parts) if scope_parts else "(none)"
+                        if attempt == 1:
+                            jar = getattr(session, "cookies", None)
+                            names = sorted({c.name for c in jar}) if jar else []
+                            ck = ",".join(names) or "(none)"
+                            print(f"[diag] cookies={ck}")
+                        hdrs = "|".join(k for k in hv.keys() if k.startswith("X-")) or "(none)"
                         print(f"[provider] try[{attempt}] {full_url} => {r.status_code} ct={ct} hdrs={hdrs}")
 
                     if r.status_code != 200:
@@ -584,6 +593,20 @@ class BoomNowHttpProvider(DeviceStatusProvider):
                                         if isinstance(guessed, list):
                                             print(f"[diag] json_path_guess='{best_path}' score={score} count={len(guessed)}")
                                             items = _extract_device_dicts(guessed)
+                                else:
+                                    try:
+                                        shape = {"_type": type(payload).__name__.lower()}
+                                        if isinstance(payload, list):
+                                            shape["len"] = len(payload)
+                                            shape["sample"] = payload[:1]
+                                        elif isinstance(payload, dict):
+                                            shape["keys"] = list(payload.keys())[:10]
+                                        print(f"[diag] payload_shape_extra={_trim_json_preview(shape)}")
+                                        cands2 = _enumerate_array_paths(payload)
+                                        if cands2:
+                                            print(f"[diag] device_array_candidates (top 5)={[(p, 0.0, 0) for p in cands2[:5]]}")
+                                    except Exception:
+                                        pass
                             except Exception:
                                 pass
                     if items:
@@ -608,11 +631,12 @@ class BoomNowHttpProvider(DeviceStatusProvider):
                     r = session.get(full_url, headers=base_hv, timeout=REQ_TIMEOUT)
                     ct = r.headers.get("content-type")
                     if DEBUG_PROVIDER:
-                        scope_parts = []
-                        for k in ("X-Team-Id", "X-Org-Id", "X-Organization-Id", "X-Company-Id", "X-Tenant-Id"):
-                            if base_hv.get(k):
-                                scope_parts.append(f"{k}={base_hv[k]}")
-                        hdrs = "|".join(scope_parts) if scope_parts else "(none)"
+                        if attempt == 1:
+                            jar = getattr(session, "cookies", None)
+                            names = sorted({c.name for c in jar}) if jar else []
+                            ck = ",".join(names) or "(none)"
+                            print(f"[diag] cookies={ck}")
+                        hdrs = "|".join(k for k in base_hv.keys() if k.startswith("X-")) or "(none)"
                         print(f"[provider] try[{attempt}] {full_url} => {r.status_code} ct={ct} hdrs={hdrs}")
                     if r.status_code != 200:
                         continue
@@ -641,6 +665,20 @@ class BoomNowHttpProvider(DeviceStatusProvider):
                                         if isinstance(guessed, list):
                                             print(f"[diag] json_path_guess='{best_path}' score={score} count={len(guessed)}")
                                             items = _extract_device_dicts(guessed)
+                                else:
+                                    try:
+                                        shape = {"_type": type(payload).__name__.lower()}
+                                        if isinstance(payload, list):
+                                            shape["len"] = len(payload)
+                                            shape["sample"] = payload[:1]
+                                        elif isinstance(payload, dict):
+                                            shape["keys"] = list(payload.keys())[:10]
+                                        print(f"[diag] payload_shape_extra={_trim_json_preview(shape)}")
+                                        cands2 = _enumerate_array_paths(payload)
+                                        if cands2:
+                                            print(f"[diag] device_array_candidates (top 5)={[(p, 0.0, 0) for p in cands2[:5]]}")
+                                    except Exception:
+                                        pass
                             except Exception:
                                 pass
                     if items:
@@ -648,15 +686,14 @@ class BoomNowHttpProvider(DeviceStatusProvider):
                 if items:
                     break
 
-        # If we never saw JSON, report content-type of the last response
-        if found_payload is None:
-            # We keep returning empty list so monitor doesn't crash; diagnostics already printed.
-            return []
+        # If we never saw JSON or we got an empty list, try scraping the dashboard as a last resort.
+        if found_payload is None or not items:
+            scraped = _scrape_dashboard_for_devices(session)
+            if scraped:
+                items = scraped
 
-        if not items:
-            html_items = _html_devices_fallback(session)
-            if html_items:
-                items = html_items
+        if found_payload is None and not items:
+            return []
 
         # Normalize to Device objects
         out: List[Device] = []
