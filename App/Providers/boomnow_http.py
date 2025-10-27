@@ -454,6 +454,23 @@ class BoomNowHttpProvider(DeviceStatusProvider):
                 if DEBUG_LEVEL >= 1:
                     print(f"[diag] form_login failed: {e}")
 
+        # ----- verify we're authenticated -----
+        whoami_candidates = ("/api/get-current-user", "/api/me", "/api/current_user")
+        authed = False
+        for path in whoami_candidates:
+            try:
+                r = session.get(f"{BASE_URL}{path}", timeout=REQ_TIMEOUT, allow_redirects=False)
+                if r.status_code == 200:
+                    authed = True
+                    break
+            except Exception:
+                pass
+
+        if not authed:
+            # Fail fast with a clear message (and keep DEBUG_PROVIDER output for context)
+            raise RuntimeError("Authentication failed: login completed but 'whoami' endpoints returned 401/404; "
+                               "check BOOMNOW_LOGIN_URL/LOGIN_KIND/EMAIL/PASSWORD and tenant SSO settings.")
+
         # Diagnostics: cookie names (values redacted)
         if DEBUG_LEVEL >= 1:
             cookie_names = sorted(session.cookies.get_dict().keys())
