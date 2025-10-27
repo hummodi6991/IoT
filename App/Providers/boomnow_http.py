@@ -13,6 +13,8 @@ DEVICES_JSON_PATH = (os.environ.get("BOOMNOW_DEVICES_JSON_PATH") or "").strip()
 DEVICES_QUERY = (os.environ.get("BOOMNOW_DEVICES_QUERY") or "").lstrip("?")
 EXTRA_HEADERS = os.environ.get("BOOMNOW_EXTRA_HEADERS")  # JSON dict, optional
 DEBUG_PROVIDER = (os.environ.get("DEBUG_PROVIDER", "0") == "1")
+ONLINE_FIELD = (os.environ.get("BOOMNOW_ONLINE_FIELD") or "").strip()
+NAME_FIELD = (os.environ.get("BOOMNOW_NAME_FIELD") or "").strip()
 # 0/1/2 where 2 prints deep diagnostics
 try:
     DEBUG_LEVEL = int(os.environ.get("DEBUG_PROVIDER", "0"))
@@ -723,11 +725,21 @@ class BoomNowHttpProvider(DeviceStatusProvider):
                 or item.get("unitName")
                 or did
             )
+            if NAME_FIELD:
+                name = _get_by_path(item, NAME_FIELD) or name
 
             online_raw = (
                 item.get("online") or item.get("isOnline") or item.get("connected") or
                 item.get("is_online") or item.get("onlineStatus")
             )
+            if online_raw is None:
+                # try more common variants for listing-devices
+                online_raw = (item.get("isConnected") or item.get("connectionStatus")
+                              or item.get("online_status") or item.get("onlineText"))
+            if ONLINE_FIELD:
+                v = _get_by_path(item, ONLINE_FIELD)
+                if v is not None:
+                    online_raw = v
             if online_raw is None and "status" in item:
                 status = item.get("status")
                 if isinstance(status, dict):
