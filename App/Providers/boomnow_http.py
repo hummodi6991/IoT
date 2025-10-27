@@ -366,6 +366,60 @@ def _coerce_online(value: Union[str, int, float, bool, None, Dict[str, Any]]) ->
     # Any other type – unknown
     return None
 
+# ---------- NEW: auto-detect which JSON path carries online/offline ----------
+def _iter_candidate_status_values(node: Any, prefix: str = ""):
+    """Yield (json_path, value) pairs for leaf nodes whose path name hints at status/online/connected."""
+    interesting = ("online", "connected", "connect", "status", "state", "indicator", "color", "dot")
+    if isinstance(node, dict):
+        for k, v in node.items():
+            path = f"{prefix}.{k}" if prefix else k
+            if isinstance(v, (dict, list)):
+                yield from _iter_candidate_status_values(v, path)
+            else:
+                lp = path.lower()
+                if any(tok in lp for tok in interesting):
+                    yield path, v
+    elif isinstance(node, list):
+        for i, v in enumerate(node[:8]):
+            p = f"{prefix}[{i}]" if prefix else f"[{i}]"
+            yield from _iter_candidate_status_values(v, p)
+
+
+def _autodetect_online_field(items: List[Dict[str, Any]]) -> Tuple[str, Dict[str, int]]:
+    """Return ``(best_json_path, stats)`` where stats is ``{"cover": N, "true": T, "false": F}``.
+
+    The chosen path must actually yield both True and False within the sample so we know the
+    signal carries more than a constant "online" response.
+    """
+
+    stats: Dict[str, Dict[str, int]] = {}
+    sample = items[: min(len(items), 80)]
+    for it in sample:
+        for path, value in _iter_candidate_status_values(it):
+            norm = _coerce_online(value)
+            if norm is None:
+                continue
+            s = stats.setdefault(path, {"cover": 0, "true": 0, "false": 0})
+            s["cover"] += 1
+            if norm is True:
+                s["true"] += 1
+            elif norm is False:
+                s["false"] += 1
+
+    best_path, best_score = None, -1.0
+    for path, s in stats.items():
+        if s["false"] == 0:
+            continue  # paths that never produce False are not useful
+        name = path.lower()
+        name_bonus = 1.0 if ("online" in name or "connect" in name) else (
+            0.5 if ("status" in name or "color" in name) else 0.0
+        )
+        score = s["cover"] + 2.5 * s["false"] + name_bonus
+        if score > best_score:
+            best_path, best_score = path, score
+
+    return best_path, stats.get(best_path, {"cover": 0, "true": 0, "false": 0})
+
 def _discover_scope_ids(session: requests.Session) -> List[str]:
     """Return numeric/uuid IDs only (ignore team/org *names*)."""
     cached = getattr(session, "_boomnow_scope_ids", None)
@@ -749,6 +803,19 @@ class BoomNowHttpProvider(DeviceStatusProvider):
 
         # Normalize to Device objects
         out: List[Device] = []
+
+        # If caller didn't force a field, try to auto-detect which JSON path gives us a real online/offline signal.
+        auto_online_path = None
+        if not ONLINE_FIELD:
+            auto_online_path, auto_stats = _autodetect_online_field(items)
+            if DEBUG_PROVIDER and auto_online_path:
+                print(
+                    f"[diag] online_field_auto='{auto_online_path}' "
+                    f"cover={auto_stats['cover']} true={auto_stats['true']} false={auto_stats['false']}"
+                )
+        elif DEBUG_PROVIDER:
+            print(f"[diag] online_field_override='{ONLINE_FIELD}'")
+
         for item in items:
             did = str(
                 item.get("id")
@@ -787,8 +854,10 @@ class BoomNowHttpProvider(DeviceStatusProvider):
                     item,
                     "isConnected", "connectionStatus", "online_status", "onlineText"
                 )
-            if ONLINE_FIELD:
-                v = _get_by_path(item, ONLINE_FIELD)
+            # Use explicit override, else the auto-detected path, if either yields a value.
+            chosen_path = ONLINE_FIELD or auto_online_path
+            if chosen_path:
+                v = _get_by_path(item, chosen_path)
                 if v is not None:
                     online_raw = v
             if online_raw is None and "status" in item:
@@ -796,7 +865,11 @@ class BoomNowHttpProvider(DeviceStatusProvider):
                 if isinstance(status, dict):
                     online_raw = status.get("name") or status.get("text") or status.get("value") or status.get("color")
                 else:
-                    online_raw = status
+                    # Only accept literal device statuses here; ignore generic wrapper values like "success".
+                    if isinstance(status, str) and status.strip().lower() in {
+                        "online","offline","up","down","connected","disconnected","ok","error"
+                    }:
+                        online_raw = status
             if online_raw is None:
                 indicator = (item.get("statusColor") or item.get("status_color") or
                              item.get("indicator") or item.get("onlineColor") or item.get("statusDot"))
