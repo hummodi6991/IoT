@@ -102,6 +102,16 @@ def _get_by_path(obj: Any, path: str):
             return None
     return cur
 
+def _first_present(d: Dict[str, Any], *keys: str) -> Any:
+    """
+    Return the first value whose key exists and whose value is not None.
+    IMPORTANT: Unlike 'a or b', this preserves explicit False.
+    """
+    for k in keys:
+        if k in d and d[k] is not None:
+            return d[k]
+    return None
+
 def _enumerate_array_paths(o: Any, prefix: str = "") -> List[str]:
     paths: List[str] = []
     if isinstance(o, dict):
@@ -766,14 +776,17 @@ class BoomNowHttpProvider(DeviceStatusProvider):
             if NAME_FIELD:
                 name = _get_by_path(item, NAME_FIELD) or name
 
-            online_raw = (
-                item.get("online") or item.get("isOnline") or item.get("connected") or
-                item.get("is_online") or item.get("onlineStatus")
+            # Preserve explicit False; do not use 'or' chains here.
+            online_raw = _first_present(
+                item,
+                "online", "isOnline", "connected", "is_online", "onlineStatus"
             )
             if online_raw is None:
-                # try more common variants for listing-devices
-                online_raw = (item.get("isConnected") or item.get("connectionStatus")
-                              or item.get("online_status") or item.get("onlineText"))
+                # try common variants for listing-devices
+                online_raw = _first_present(
+                    item,
+                    "isConnected", "connectionStatus", "online_status", "onlineText"
+                )
             if ONLINE_FIELD:
                 v = _get_by_path(item, ONLINE_FIELD)
                 if v is not None:
