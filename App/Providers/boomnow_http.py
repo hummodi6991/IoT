@@ -309,14 +309,52 @@ def _extract_device_dicts(payload: Any) -> List[Dict[str, Any]]:
             out.append(_unwrap_device_dict(it))
     return out
 
-def _coerce_online(value: Union[str, int, float, bool, None]) -> bool:
-    if isinstance(value, bool): return value
-    if isinstance(value, (int, float)): return value != 0
+def _coerce_online(value: Union[str, int, float, bool, None, Dict[str, Any]]) -> Any:
+    """
+    Convert heterogeneous "online" signals to True/False.
+    IMPORTANT: unknown / not-present must return None (NOT False),
+    otherwise every device without a recognized field is treated as offline.
+    """
+    # Unknown / missing
+    if value is None:
+        return None
+
+    # If the backend nests status data in a dict, try common keys inside it.
+    if isinstance(value, dict):
+        for k in ("online","isOnline","connected","is_connected",
+                  "status","statusText","text","name","value","color","indicator"):
+            if k in value:
+                inner = _coerce_online(value[k])
+                if inner is not None:
+                    return inner
+        return None
+
+    # Primitive forms
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
     if isinstance(value, str):
-        v = value.strip().lower()
-        if v in {"true","1","yes","online","up","connected","active","alive"}: return True
-        if v in {"false","0","no","offline","down","inactive","disconnected","no data","unknown","n/a","na","not available","none","null","—","-"}: return False
-    return bool(value)
+        raw = value.strip()
+        if raw == "":
+            return None
+        v = raw.lower()
+        # positive synonyms
+        if v in {"true","1","yes","online","up","connected","active","alive","ok","healthy"}:
+            return True
+        # negative synonyms (and the UI text we observed)
+        if v in {"false","0","no","offline","down","inactive","disconnected",
+                 "no data","unknown","n/a","na","not available","none","null","—","-",
+                 "red","danger","error"}:
+            return False
+        # Common color/label heuristics
+        if v in {"green","success"}:
+            return True
+        # Unrecognized string – don't guess
+        return None
+
+    # Any other type – unknown
+    return None
 
 def _discover_scope_ids(session: requests.Session) -> List[str]:
     """Return numeric/uuid IDs only (ignore team/org *names*)."""
