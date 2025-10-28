@@ -15,6 +15,11 @@ EXTRA_HEADERS = os.environ.get("BOOMNOW_EXTRA_HEADERS")  # JSON dict, optional
 DEBUG_PROVIDER = (os.environ.get("DEBUG_PROVIDER", "0") == "1")
 ONLINE_FIELD = (os.environ.get("BOOMNOW_ONLINE_FIELD") or "").strip()
 NAME_FIELD = (os.environ.get("BOOMNOW_NAME_FIELD") or "").strip()
+# Force “UI color only” logic:
+# When set, we ignore boolean/text fields and base status ONLY on a color
+# value like "green"/"red" (or "success"/"danger"/"error").
+COLOR_ONLY = (os.environ.get("BOOMNOW_COLOR_ONLY", "0") == "1")
+COLOR_FIELD = (os.environ.get("BOOMNOW_COLOR_FIELD") or "").strip()
 # 0/1/2 where 2 prints deep diagnostics
 try:
     DEBUG_LEVEL = int(os.environ.get("DEBUG_PROVIDER", "0"))
@@ -350,7 +355,7 @@ def _coerce_online(value):
             return None
         v = raw.lower()
         # positive synonyms
-        if v in {"true","1","yes","online","up","connected","active","alive","ok","healthy"}:
+        if v in {"true","1","yes","online","up","connected","active","alive","ok","healthy","green","success"}:
             return True
         # definite negatives
         if v in {"false","0","no","offline","down","inactive","disconnected","red","danger","error"}:
@@ -803,7 +808,7 @@ class BoomNowHttpProvider(DeviceStatusProvider):
 
         # If caller didn't force a field, try to auto-detect which JSON path gives us a real online/offline signal.
         auto_online_path = None
-        if not ONLINE_FIELD:
+        if not ONLINE_FIELD and not COLOR_ONLY:
             auto_online_path, auto_stats = _autodetect_online_field(items)
             if DEBUG_PROVIDER and auto_online_path:
                 print(
@@ -853,25 +858,41 @@ class BoomNowHttpProvider(DeviceStatusProvider):
                     )
                 else:
                     status_text = st
-            ui_indicator = status_text or item.get("statusColor") or item.get("status_color") \
-                           or item.get("indicator") or item.get("onlineColor") or item.get("statusDot")
+
+            color_value = None
+            if COLOR_FIELD:
+                color_value = _get_by_path(item, COLOR_FIELD)
+            if color_value is None:
+                color_value = (
+                    item.get("statusColor")
+                    or item.get("status_color")
+                    or item.get("onlineColor")
+                    or item.get("statusDot")
+                    or item.get("indicator")
+                )
+
+            ui_indicator = color_value if COLOR_ONLY else (status_text or color_value)
             online_from_ui = _coerce_online(ui_indicator)
 
-            # 2) Then look at boolean-ish fields
-            online_boolish = _first_present(
-                item,
-                "online", "isOnline", "connected", "is_online", "onlineStatus",
-                "isConnected", "connectionStatus", "online_status", "onlineText"
-            )
-            # Optional exact field override via env
-            if ONLINE_FIELD:
-                v = _get_by_path(item, ONLINE_FIELD)
-                if v is not None:
-                    online_boolish = v
+            online_boolish = None
+            if not COLOR_ONLY:
+                online_boolish = _first_present(
+                    item,
+                    "online", "isOnline", "connected", "is_online", "onlineStatus",
+                    "isConnected", "connectionStatus", "online_status", "onlineText"
+                )
+                # Optional exact field override via env
+                if ONLINE_FIELD:
+                    v = _get_by_path(item, ONLINE_FIELD)
+                    if v is not None:
+                        online_boolish = v
 
-            online = online_from_ui if online_from_ui is not None else _coerce_online(online_boolish)
+            if COLOR_ONLY:
+                online = _coerce_online(color_value)
+            else:
+                online = online_from_ui if online_from_ui is not None else _coerce_online(online_boolish)
 
-            if online is None and auto_online_path:
+            if online is None and auto_online_path and not COLOR_ONLY:
                 online = _coerce_online(_get_by_path(item, auto_online_path))
 
             battery = None
