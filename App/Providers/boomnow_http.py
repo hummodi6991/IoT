@@ -14,6 +14,7 @@ DEVICES_QUERY = (os.environ.get("BOOMNOW_DEVICES_QUERY") or "").lstrip("?")
 EXTRA_HEADERS = os.environ.get("BOOMNOW_EXTRA_HEADERS")  # JSON dict, optional
 DEBUG_PROVIDER = (os.environ.get("DEBUG_PROVIDER", "0") == "1")
 ONLINE_FIELD = (os.environ.get("BOOMNOW_ONLINE_FIELD") or "").strip()
+STRICT_UI = (os.environ.get("BOOMNOW_STRICT_UI", "0") == "1")
 NAME_FIELD = (os.environ.get("BOOMNOW_NAME_FIELD") or "").strip()
 # Force “UI color only” logic:
 # When set, we ignore boolean/text fields and base status ONLY on a color
@@ -106,6 +107,33 @@ def _get_by_path(obj: Any, path: str):
         else:
             return None
     return cur
+
+def _from_ui_color_dictish(v: Any) -> Any:
+    """Unwrap tiny dicts used for indicators: {color|text|name|value: 'green'}."""
+    if isinstance(v, dict):
+        for k in ("color", "value", "text", "name"):
+            if k in v and v[k] is not None:
+                return v[k]
+    return v
+
+def _pick_ui_color(item: Dict[str, Any]) -> Any:
+    """
+    Return the *UI dot/color* value if present.
+    We check common keys seen in lock dashboards.
+    """
+    keys = (
+        "statusColor", "status_color", "statusDot", "indicator", "onlineColor",
+        "properties.statusColor", "properties.onlineColor", "properties.statusDot",
+        "ui.statusColor", "ui.onlineColor", "ui.dot",
+    )
+    for k in keys:
+        v = _get_by_path(item, k)
+        if v is None:
+            continue
+        v = _from_ui_color_dictish(v)
+        if v is not None:
+            return v
+    return None
 
 def _first_present(d: Dict[str, Any], *keys: str) -> Any:
     """
@@ -845,55 +873,56 @@ class BoomNowHttpProvider(DeviceStatusProvider):
             if NAME_FIELD:
                 name = _get_by_path(item, NAME_FIELD) or name
 
-            # 1) Prefer the same thing the UI uses (status text / color)
-            status_text = None
-            if "status" in item:
-                st = item["status"]
-                if isinstance(st, dict):
-                    status_text = (
-                        st.get("text")
-                        or st.get("name")
-                        or st.get("value")
-                        or st.get("color")
-                    )
-                else:
-                    status_text = st
-
+            # Collect UI indicator fields the dashboards tend to use (color/dot).
             color_value = None
             if COLOR_FIELD:
                 color_value = _get_by_path(item, COLOR_FIELD)
+            picked_ui_color = _pick_ui_color(item)
             if color_value is None:
-                color_value = (
-                    item.get("statusColor")
-                    or item.get("status_color")
-                    or item.get("onlineColor")
-                    or item.get("statusDot")
-                    or item.get("indicator")
-                )
+                color_value = picked_ui_color
 
-            ui_indicator = color_value if COLOR_ONLY else (status_text or color_value)
-            online_from_ui = _coerce_online(ui_indicator)
-
-            online_boolish = None
-            if not COLOR_ONLY:
-                online_boolish = _first_present(
+            if COLOR_ONLY:
+                online_raw = color_value
+            else:
+                # 1) explicit boolean-like fields
+                online_raw = _first_present(
                     item,
                     "online", "isOnline", "connected", "is_online", "onlineStatus",
                     "isConnected", "connectionStatus", "online_status", "onlineText"
                 )
-                # Optional exact field override via env
+
+                # 2) explicit override path
                 if ONLINE_FIELD:
                     v = _get_by_path(item, ONLINE_FIELD)
                     if v is not None:
-                        online_boolish = v
+                        online_raw = v
 
-            if COLOR_ONLY:
-                online = _coerce_online(color_value)
-            else:
-                online = online_from_ui if online_from_ui is not None else _coerce_online(online_boolish)
+                # 3) strict UI color/dot (green/red) takes precedence when enabled
+                if STRICT_UI or online_raw is None:
+                    ui_val = color_value if color_value is not None else picked_ui_color
+                    if ui_val is not None:
+                        online_raw = ui_val
 
-            if online is None and auto_online_path and not COLOR_ONLY:
-                online = _coerce_online(_get_by_path(item, auto_online_path))
+                # 4) generic 'status' only if it *clearly* carries online/offline semantics
+                if not STRICT_UI and online_raw is None and "status" in item:
+                    status = item.get("status")
+                    extract = status
+                    if isinstance(status, dict):
+                        for k in ("name", "text", "value", "color"):
+                            if k in status and status[k] is not None:
+                                extract = status[k]
+                                break
+                    # Only keep this if we can coerce it to True/False; otherwise ignore.
+                    tmp = _coerce_online(extract)
+                    if tmp is not None:
+                        online_raw = extract
+
+                if online_raw is None and auto_online_path:
+                    auto_val = _get_by_path(item, auto_online_path)
+                    if auto_val is not None:
+                        online_raw = auto_val
+
+            online = _coerce_online(online_raw)
 
             battery = None
             for k in ("battery","batteryPercent","battery_percentage","batteryLevel","battery_level"):
