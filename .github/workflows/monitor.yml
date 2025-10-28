@@ -5,6 +5,9 @@ on:
     - cron: '*/5 * * * *'
   workflow_dispatch:
 
+permissions:
+  contents: write   # allow the action to push state
+
 jobs:
   monitor:
     runs-on: ubuntu-latest
@@ -12,6 +15,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: true
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -64,3 +69,14 @@ jobs:
           from app.main import main
           main()
           PY
+
+      - name: Commit state if changed
+        if: always()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if [ -n "$(git status --porcelain state/state.json || true)" ]; then
+            git add state/state.json
+            git commit -m "chore(state): update $(date -u +'%Y-%m-%d %H:%M:%S')"
+            git push
+          fi
