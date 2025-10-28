@@ -319,88 +319,48 @@ def _extract_device_dicts(payload: Any) -> List[Dict[str, Any]]:
             out.append(_unwrap_device_dict(it))
     return out
 
-def _coerce_online(value: Union[str, int, float, bool, None, Dict[str, Any]]) -> Union[bool, None]:
+def _coerce_online(value):
     """
-    Map heterogeneous signals to: True / False / None (unknown).
-    - Unknown/missing MUST remain None (never assume offline).
-    - Understand common dict wrappers and color/label synonyms.
+    Convert heterogeneous "online" signals to True/False.
+    IMPORTANT: unknown / not-present must return None (NOT False),
+    otherwise every device without a recognized field is treated as offline.
     """
+    # Unknown / missing
     if value is None:
         return None
 
+    # If the backend nests status data in a dict, try common keys inside it.
     if isinstance(value, dict):
-        for k in (
-            "online",
-            "isOnline",
-            "connected",
-            "is_connected",
-            "status",
-            "statusText",
-            "text",
-            "name",
-            "value",
-            "color",
-            "indicator",
-        ):
+        for k in ("online","isOnline","connected","is_connected",
+                  "status","statusText","text","name","value","color","indicator"):
             if k in value:
-                out = _coerce_online(value[k])
-                if out is not None:
-                    return out
+                inner = _coerce_online(value[k])
+                if inner is not None:
+                    return inner
         return None
 
+    # Primitive forms
     if isinstance(value, bool):
         return value
     if isinstance(value, (int, float)):
         return value != 0
     if isinstance(value, str):
-        v = value.strip().lower()
-        if v == "":
+        raw = value.strip()
+        if raw == "":
             return None
-        positives = {
-            "true",
-            "1",
-            "yes",
-            "online",
-            "up",
-            "connected",
-            "active",
-            "alive",
-            "ok",
-            "healthy",
-            "green",
-            "success",
-        }
-        negatives = {
-            "false",
-            "0",
-            "no",
-            "offline",
-            "down",
-            "inactive",
-            "disconnected",
-            "red",
-            "danger",
-            "error",
-        }
-        unknowns = {
-            "no data",
-            "unknown",
-            "n/a",
-            "na",
-            "not available",
-            "none",
-            "null",
-            "—",
-            "-",
-        }
-        if v in positives:
+        v = raw.lower()
+        # positive synonyms
+        if v in {"true","1","yes","online","up","connected","active","alive","ok","healthy"}:
             return True
-        if v in negatives:
+        # definite negatives
+        if v in {"false","0","no","offline","down","inactive","disconnected","red","danger","error"}:
             return False
-        if v in unknowns:
+        # unknown / NA values → None (do NOT count as offline)
+        if v in {"no data","unknown","n/a","na","not available","none","null","—","-"}:
             return None
         return None
 
+    # Any other type – unknown
     return None
 
 # ---------- NEW: auto-detect which JSON path carries online/offline ----------
@@ -880,45 +840,39 @@ class BoomNowHttpProvider(DeviceStatusProvider):
             if NAME_FIELD:
                 name = _get_by_path(item, NAME_FIELD) or name
 
-            online = _coerce_online(
-                item.get("statusColor")
-                or item.get("status_color")
-                or item.get("statusDot")
-                or item.get("onlineColor")
-            )
-
-            if online is None:
-                status = item.get("status")
-                if isinstance(status, dict):
-                    for k in ("color", "text", "name", "value", "state"):
-                        online = _coerce_online(status.get(k))
-                        if online is not None:
-                            break
+            # 1) Prefer the same thing the UI uses (status text / color)
+            status_text = None
+            if "status" in item:
+                st = item["status"]
+                if isinstance(st, dict):
+                    status_text = (
+                        st.get("text")
+                        or st.get("name")
+                        or st.get("value")
+                        or st.get("color")
+                    )
                 else:
-                    online = _coerce_online(status)
+                    status_text = st
+            ui_indicator = status_text or item.get("statusColor") or item.get("status_color") \
+                           or item.get("indicator") or item.get("onlineColor") or item.get("statusDot")
+            online_from_ui = _coerce_online(ui_indicator)
 
-            if online is None and ONLINE_FIELD:
-                online = _coerce_online(_get_by_path(item, ONLINE_FIELD))
+            # 2) Then look at boolean-ish fields
+            online_boolish = _first_present(
+                item,
+                "online", "isOnline", "connected", "is_online", "onlineStatus",
+                "isConnected", "connectionStatus", "online_status", "onlineText"
+            )
+            # Optional exact field override via env
+            if ONLINE_FIELD:
+                v = _get_by_path(item, ONLINE_FIELD)
+                if v is not None:
+                    online_boolish = v
+
+            online = online_from_ui if online_from_ui is not None else _coerce_online(online_boolish)
 
             if online is None and auto_online_path:
                 online = _coerce_online(_get_by_path(item, auto_online_path))
-
-            if online is None:
-                for fld in (
-                    "isOnline",
-                    "connected",
-                    "isConnected",
-                    "online",
-                    "is_online",
-                    "onlineStatus",
-                    "connectionStatus",
-                    "online_status",
-                    "onlineText",
-                ):
-                    maybe = _coerce_online(item.get(fld))
-                    if maybe is not None:
-                        online = maybe
-                        break
 
             battery = None
             for k in ("battery","batteryPercent","battery_percentage","batteryLevel","battery_level"):
