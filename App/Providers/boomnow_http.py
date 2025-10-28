@@ -14,6 +14,10 @@ DEVICES_QUERY = (os.environ.get("BOOMNOW_DEVICES_QUERY") or "").lstrip("?")
 EXTRA_HEADERS = os.environ.get("BOOMNOW_EXTRA_HEADERS")  # JSON dict, optional
 DEBUG_PROVIDER = (os.environ.get("DEBUG_PROVIDER", "0") == "1")
 ONLINE_FIELD = (os.environ.get("BOOMNOW_ONLINE_FIELD") or "").strip()
+REQUIRED_CAPABILITY = (os.environ.get("BOOMNOW_REQUIRED_CAPABILITY") or "lock").strip().lower()
+_ENV_TRUTHY = {"1","true","yes","on","y","t"}
+ONLY_ACTIVE = str(os.environ.get("BOOMNOW_ONLY_ACTIVE", "1")).strip().lower() in _ENV_TRUTHY
+ONLY_MANAGED = str(os.environ.get("BOOMNOW_ONLY_MANAGED", "1")).strip().lower() in _ENV_TRUTHY
 STRICT_UI_COLOR = (os.environ.get("BOOMNOW_STRICT_UI_COLOR", "0") == "1")
 STRICT_UI = (os.environ.get("BOOMNOW_STRICT_UI", "0") == "1")
 NAME_FIELD = (os.environ.get("BOOMNOW_NAME_FIELD") or "").strip()
@@ -109,6 +113,24 @@ def _get_by_path(obj: Any, path: str):
             return None
     return cur
 
+def _truthy(v: Any) -> bool:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return v != 0
+    if isinstance(v, str):
+        stripped = v.strip()
+        if stripped == "":
+            return False
+        lowered = stripped.lower()
+        if lowered in {"false", "0", "no", "off", "inactive", "offline"}:
+            return False
+        return lowered in {"1", "true", "yes", "on", "active", "connected", "online", "y"}
+    return bool(v)
+
+def _get_bool_path(item: Dict[str, Any], path: str) -> bool:
+    return _truthy(_get_by_path(item, path))
+
 def _from_ui_color_dictish(v: Any) -> Any:
     """Unwrap tiny dicts used for indicators: {color|text|name|value: 'green'}."""
     if isinstance(v, dict):
@@ -145,6 +167,34 @@ def _first_present(d: Dict[str, Any], *keys: str) -> Any:
         if k in d and d[k] is not None:
             return d[k]
     return None
+
+def _has_capability(item: Dict[str, Any], cap: str) -> bool:
+    if not cap:
+        return True
+
+    value = _first_present(
+        item,
+        "capabilities_supported",
+        "capabilitiesSupported",
+        "capabilities",
+        "capability",
+    )
+
+    if value is None:
+        value = _get_by_path(item, "properties.capabilities")
+
+    caps: List[str]
+    if isinstance(value, dict):
+        caps = [str(k) for k, v in value.items() if _truthy(v)]
+    elif isinstance(value, (list, tuple, set)):
+        caps = [str(v) for v in value]
+    elif isinstance(value, str):
+        caps = [part for part in re.split(r"[,\s]+", value) if part]
+    else:
+        caps = []
+
+    normalized = [c.strip().lower() for c in caps if c and c.strip()]
+    return cap.lower() in normalized
 
 def _enumerate_array_paths(o: Any, prefix: str = "") -> List[str]:
     paths: List[str] = []
@@ -896,6 +946,9 @@ class BoomNowHttpProvider(DeviceStatusProvider):
         color_cover = color_true = color_false = 0
         bool_cover = bool_true = bool_false = 0
 
+        filtered_count = 0
+        offline_filtered = 0
+
         for item in items:
             did = str(
                 item.get("id")
@@ -923,6 +976,18 @@ class BoomNowHttpProvider(DeviceStatusProvider):
             if NAME_FIELD:
                 name = _get_by_path(item, NAME_FIELD) or name
 
+            in_use = True
+            if ONLY_ACTIVE:
+                in_use = in_use and _get_bool_path(item, "boom.active")
+            if ONLY_MANAGED:
+                managed_val = _first_present(item, "is_managed", "isManaged")
+                in_use = in_use and _truthy(managed_val)
+            if REQUIRED_CAPABILITY:
+                in_use = in_use and _has_capability(item, REQUIRED_CAPABILITY)
+            if not in_use:
+                continue
+            filtered_count += 1
+
             # Collect UI indicator fields the dashboards tend to use (color/dot).
             color_value = None
             if COLOR_FIELD:
@@ -943,41 +1008,52 @@ class BoomNowHttpProvider(DeviceStatusProvider):
                 if color_signal is False:
                     color_false += 1
 
+            online_raw = None
+            bool_candidate = None
+
             if COLOR_ONLY:
                 if color_signal is not None:
                     online_raw = color_signal
                 else:
                     online_raw = color_value
             else:
-                online_raw = None
+                if ONLINE_FIELD:
+                    candidate = _get_by_path(item, ONLINE_FIELD)
+                    if candidate is not None:
+                        online_raw = candidate
+                        bool_candidate = candidate
 
-                if STRICT_UI_COLOR or STRICT_UI:
-                    if color_signal is not None:
-                        online_raw = color_signal
-                    elif color_value is not None:
-                        online_raw = color_value
+                if online_raw is None and auto_online_path:
+                    candidate = _get_by_path(item, auto_online_path)
+                    if candidate is not None:
+                        online_raw = candidate
+                        if bool_candidate is None:
+                            bool_candidate = candidate
 
-                bool_raw = None
                 if online_raw is None:
-                    bool_raw = _first_present(
+                    candidate = _first_present(
                         item,
                         "online", "isOnline", "connected", "is_online", "onlineStatus",
                         "isConnected", "connectionStatus", "online_status", "onlineText"
                     )
+                    if candidate is not None:
+                        online_raw = candidate
+                        if bool_candidate is None:
+                            bool_candidate = candidate
 
-                    if ONLINE_FIELD:
-                        v = _get_by_path(item, ONLINE_FIELD)
-                        if v is not None:
-                            bool_raw = v
+                if bool_candidate is not None:
+                    bool_cover += 1
+                    coerced_bool = _coerce_online(bool_candidate)
+                    if coerced_bool is True:
+                        bool_true += 1
+                    if coerced_bool is False:
+                        bool_false += 1
 
-                    if bool_raw is not None:
-                        bool_cover += 1
-                        coerced_bool = _coerce_online(bool_raw)
-                        if coerced_bool is True:
-                            bool_true += 1
-                        if coerced_bool is False:
-                            bool_false += 1
-                        online_raw = bool_raw
+                if online_raw is None and (STRICT_UI_COLOR or STRICT_UI):
+                    if color_signal is not None:
+                        online_raw = color_signal
+                    elif color_value is not None:
+                        online_raw = color_value
 
                 if online_raw is None and not STRICT_UI:
                     if color_signal is not None:
@@ -994,17 +1070,21 @@ class BoomNowHttpProvider(DeviceStatusProvider):
                             if c is not None:
                                 online_raw = c
                                 break
-                    elif isinstance(status, str) and (
-                        "online" in status.lower() or "offline" in status.lower()
-                    ):
+                    else:
                         online_raw = _coerce_online(status)
 
-                if online_raw is None and auto_online_path:
-                    auto_val = _get_by_path(item, auto_online_path)
-                    if auto_val is not None:
-                        online_raw = auto_val
+                if online_raw is None:
+                    indicator = (
+                        item.get("statusColor") or item.get("status_color") or
+                        item.get("indicator") or item.get("onlineColor") or item.get("statusDot")
+                    )
+                    if indicator:
+                        sv = str(indicator).strip().lower()
+                        online_raw = True if sv in {"green","success","ok"} else False if sv in {"red","danger","error"} else None
 
             online = _coerce_online(online_raw)
+            if online is False:
+                offline_filtered += 1
 
             battery = None
             for k in ("battery","batteryPercent","battery_percentage","batteryLevel","battery_level"):
@@ -1014,6 +1094,9 @@ class BoomNowHttpProvider(DeviceStatusProvider):
             out.append(Device(id=did, name=name, online=online, battery=battery, extra=item))
 
         if DEBUG_LEVEL >= 1:
+            print(
+                f"[diag] filtered_count={filtered_count} offline_count={offline_filtered} online_field='{ONLINE_FIELD or auto_online_path or '(auto)'}'"
+            )
             print(
                 "[diag] ui_color cover="
                 f"{color_cover} green={color_true} red={color_false} | boolean cover={bool_cover} true={bool_true} false={bool_false}"
