@@ -14,6 +14,7 @@ DEVICES_QUERY = (os.environ.get("BOOMNOW_DEVICES_QUERY") or "").lstrip("?")
 EXTRA_HEADERS = os.environ.get("BOOMNOW_EXTRA_HEADERS")  # JSON dict, optional
 DEBUG_PROVIDER = (os.environ.get("DEBUG_PROVIDER", "0") == "1")
 ONLINE_FIELD = (os.environ.get("BOOMNOW_ONLINE_FIELD") or "").strip()
+STRICT_UI_COLOR = (os.environ.get("BOOMNOW_STRICT_UI_COLOR", "0") == "1")
 STRICT_UI = (os.environ.get("BOOMNOW_STRICT_UI", "0") == "1")
 NAME_FIELD = (os.environ.get("BOOMNOW_NAME_FIELD") or "").strip()
 # Force “UI color only” logic:
@@ -382,18 +383,64 @@ def _coerce_online(value):
         if raw == "":
             return None
         v = raw.lower()
-        # positive synonyms
-        if v in {"true","1","yes","online","up","connected","active","alive","ok","healthy","green","success"}:
+        # accept substrings so 'text-success', 'bg-red-500' etc. work
+        if (
+            "online" in v
+            or "success" in v
+            or "green" in v
+            or v in {"true", "1", "yes", "up", "connected", "active", "alive", "ok", "healthy"}
+        ):
             return True
-        # definite negatives
-        if v in {"false","0","no","offline","down","inactive","disconnected","red","danger","error"}:
+        if (
+            "offline" in v
+            or "danger" in v
+            or "error" in v
+            or "red" in v
+            or v in {"false", "0", "no", "down", "inactive", "disconnected"}
+        ):
             return False
         # unknown / NA values → None (do NOT count as offline)
-        if v in {"no data","unknown","n/a","na","not available","none","null","—","-"}:
+        if v in {"no data", "unknown", "n/a", "na", "not available", "none", "null", "—", "-"}:
             return None
         return None
 
     # Any other type – unknown
+    return None
+
+def _scan_for_ui_color(o: Any) -> Any:
+    """
+    Look for UI dot color specifically. We only consider keys that look like the Online column:
+    - statusColor, status_color, statusDot, indicator, onlineColor, online_color, onlineDot
+    - any key name containing both 'online' and 'color'
+    Returns True/False if a clear green/red signal is found, else None.
+    """
+    KEYS = {
+        "statuscolor", "status_color", "statusdot", "indicator",
+        "onlinecolor", "online_color", "onlinedot", "online_dot",
+    }
+    found: List[str] = []
+
+    def walk(x: Any):
+        if isinstance(x, dict):
+            for k, v in x.items():
+                kl = k.lower()
+                key_hit = (kl in KEYS) or ("online" in kl and "color" in kl)
+                if key_hit and isinstance(v, (str, int, float, bool)):
+                    found.append(str(v))
+                if isinstance(v, (dict, list)):
+                    walk(v)
+        elif isinstance(x, list):
+            for it in x[:50]:
+                walk(it)
+
+    walk(o)
+
+    for s in found:
+        v = str(s).strip().lower()
+        if "green" in v or "success" in v or "ok" in v or "online" in v:
+            return True
+        if "red" in v or "danger" in v or "error" in v or "offline" in v:
+            return False
     return None
 
 # ---------- NEW: auto-detect which JSON path carries online/offline ----------
@@ -846,6 +893,9 @@ class BoomNowHttpProvider(DeviceStatusProvider):
         elif DEBUG_PROVIDER:
             print(f"[diag] online_field_override='{ONLINE_FIELD}'")
 
+        color_cover = color_true = color_false = 0
+        bool_cover = bool_true = bool_false = 0
+
         for item in items:
             did = str(
                 item.get("id")
@@ -881,41 +931,73 @@ class BoomNowHttpProvider(DeviceStatusProvider):
             if color_value is None:
                 color_value = picked_ui_color
 
+            color_signal = _scan_for_ui_color(item)
+            if color_signal is None and color_value is not None:
+                coerced_color = _coerce_online(color_value)
+                if coerced_color is not None:
+                    color_signal = coerced_color
+            if color_signal is not None:
+                color_cover += 1
+                if color_signal is True:
+                    color_true += 1
+                if color_signal is False:
+                    color_false += 1
+
             if COLOR_ONLY:
-                online_raw = color_value
+                if color_signal is not None:
+                    online_raw = color_signal
+                else:
+                    online_raw = color_value
             else:
-                # 1) explicit boolean-like fields
-                online_raw = _first_present(
-                    item,
-                    "online", "isOnline", "connected", "is_online", "onlineStatus",
-                    "isConnected", "connectionStatus", "online_status", "onlineText"
-                )
+                online_raw = None
 
-                # 2) explicit override path
-                if ONLINE_FIELD:
-                    v = _get_by_path(item, ONLINE_FIELD)
-                    if v is not None:
-                        online_raw = v
+                if STRICT_UI_COLOR or STRICT_UI:
+                    if color_signal is not None:
+                        online_raw = color_signal
+                    elif color_value is not None:
+                        online_raw = color_value
 
-                # 3) strict UI color/dot (green/red) takes precedence when enabled
-                if STRICT_UI or online_raw is None:
-                    ui_val = color_value if color_value is not None else picked_ui_color
-                    if ui_val is not None:
-                        online_raw = ui_val
+                bool_raw = None
+                if online_raw is None:
+                    bool_raw = _first_present(
+                        item,
+                        "online", "isOnline", "connected", "is_online", "onlineStatus",
+                        "isConnected", "connectionStatus", "online_status", "onlineText"
+                    )
 
-                # 4) generic 'status' only if it *clearly* carries online/offline semantics
-                if not STRICT_UI and online_raw is None and "status" in item:
+                    if ONLINE_FIELD:
+                        v = _get_by_path(item, ONLINE_FIELD)
+                        if v is not None:
+                            bool_raw = v
+
+                    if bool_raw is not None:
+                        bool_cover += 1
+                        coerced_bool = _coerce_online(bool_raw)
+                        if coerced_bool is True:
+                            bool_true += 1
+                        if coerced_bool is False:
+                            bool_false += 1
+                        online_raw = bool_raw
+
+                if online_raw is None and not STRICT_UI:
+                    if color_signal is not None:
+                        online_raw = color_signal
+                    elif color_value is not None:
+                        online_raw = color_value
+
+                if online_raw is None and "status" in item:
                     status = item.get("status")
-                    extract = status
                     if isinstance(status, dict):
-                        for k in ("name", "text", "value", "color"):
-                            if k in status and status[k] is not None:
-                                extract = status[k]
+                        for k in ("color", "text", "name", "value"):
+                            s = status.get(k)
+                            c = _coerce_online(s)
+                            if c is not None:
+                                online_raw = c
                                 break
-                    # Only keep this if we can coerce it to True/False; otherwise ignore.
-                    tmp = _coerce_online(extract)
-                    if tmp is not None:
-                        online_raw = extract
+                    elif isinstance(status, str) and (
+                        "online" in status.lower() or "offline" in status.lower()
+                    ):
+                        online_raw = _coerce_online(status)
 
                 if online_raw is None and auto_online_path:
                     auto_val = _get_by_path(item, auto_online_path)
@@ -931,4 +1013,9 @@ class BoomNowHttpProvider(DeviceStatusProvider):
 
             out.append(Device(id=did, name=name, online=online, battery=battery, extra=item))
 
+        if DEBUG_LEVEL >= 1:
+            print(
+                "[diag] ui_color cover="
+                f"{color_cover} green={color_true} red={color_false} | boolean cover={bool_cover} true={bool_true} false={bool_false}"
+            )
         return out
