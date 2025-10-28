@@ -1,6 +1,5 @@
-import html
 import os, time, traceback
-from typing import Dict, Iterable, Optional
+from typing import Dict
 from app.device import Device
 from app.state import load_state, save_state, now_ts
 from app.notify.emailer import send_email, _smtp_client
@@ -23,280 +22,74 @@ def provider():
     else:
         raise RuntimeError(f"Unknown PROVIDER: {PROVIDER}")
 
-def _normalize_str(value: Optional[str]) -> str:
-    if not value:
-        return ""
-    return " ".join(value.split())
-
-
-def _string_from(value) -> str:
-    if isinstance(value, str):
-        return _normalize_str(value)
-    if isinstance(value, (list, tuple)):
-        for item in value:
-            s = _string_from(item)
-            if s:
-                return s
-        return ""
-    if isinstance(value, dict):
-        for key in (
-            "name",
-            "label",
-            "title",
-            "displayName",
-            "display_name",
-            "description",
-            "value",
-            "text",
-        ):
-            s = _string_from(value.get(key))
-            if s:
-                return s
-    return ""
-
-
-def _get_by_path(data: Dict, path: str):
-    current = data
-    for part in path.split("."):
-        if not isinstance(current, dict) or part not in current:
-            return None
-        current = current[part]
-    return current
-
-
-def _first_field(extra: Dict, candidates: Iterable[str]) -> str:
-    for key in candidates:
-        value = None
-        if "." in key:
-            value = _get_by_path(extra, key)
-        else:
-            value = extra.get(key)
-        s = _string_from(value)
-        if s:
-            return s
-    return ""
-
-
 def _listing_name(d: Device) -> str:
     e = (d.extra or {})
+    # common patterns from listing-devices
     if isinstance(e.get("listing"), dict):
-        listing = _string_from(e["listing"])
-        if listing:
-            return listing
-        for key in ("name", "title"):
-            listing = _string_from(e["listing"].get(key))
-            if listing:
-                return listing
-    return _first_field(
-        e,
-        (
-            "listingName",
-            "listing_name",
-            "unitName",
-            "unit_name",
-            "roomName",
-            "room_name",
-            "apartmentName",
-            "propertyName",
-            "buildingName",
-        ),
-    )
-
-
-def _entry_point_name(d: Device) -> str:
-    e = d.extra or {}
-    return _first_field(
-        e,
-        (
-            "entryPointName",
-            "entryPoint",
-            "entry_point",
-            "entry.name",
-            "entry.label",
-            "doorName",
-            "door.name",
-            "door.label",
-            "lockName",
-            "lock.name",
-            "lock.label",
-            "boom.entryPoint.name",
-            "boom.door.name",
-        ),
-    )
-
-
-def _entry_details(d: Device) -> str:
-    e = d.extra or {}
-    return _first_field(
-        e,
-        (
-            "entryDetails",
-            "entry_details",
-            "entry.detail",
-            "entryDetail",
-            "entry_detail",
-            "codeName",
-            "code_name",
-            "accessCode",
-            "access_code",
-            "accessCodeName",
-            "access_code_name",
-            "pinCode",
-            "pin_code",
-            "credential",
-            "credentialName",
-            "credential_name",
-            "boom.entry.details",
-            "boom.entry.codeName",
-        ),
-    )
-
-
-def _hardware_label(d: Device) -> str:
-    if d.name and d.name != d.id:
-        hardware = _normalize_str(d.name)
-        if hardware:
-            return hardware
-    e = d.extra or {}
-    return _first_field(
-        e,
-        (
-            "deviceName",
-            "device_name",
-            "deviceLabel",
-            "device_label",
-            "hardwareName",
-            "hardware_name",
-            "lockModel",
-            "modelName",
-        ),
-    )
-
-
-def _device_display_label(d: Device) -> str:
-    e = d.extra or {}
-    candidates = [
-        _entry_point_name(d),
-        _first_field(
-            e,
-            (
-                "displayName",
-                "display_name",
-                "alias",
-                "nickname",
-                "name",
-            ),
-        ),
-        _hardware_label(d),
-    ]
-    for candidate in candidates:
-        if candidate and candidate != d.id:
-            return candidate
-    return d.id
-
-
-def _subject_label(d: Device) -> str:
-    parts = [_device_display_label(d), _listing_name(d)]
-    seen = []
-    for part in parts:
-        normalized = _normalize_str(part)
-        if normalized and normalized not in seen:
-            seen.append(normalized)
-    return " — ".join(seen) if seen else d.id
-
-
-def _details_rows(d: Device):
-    rows = []
-    display = _device_display_label(d)
-    if display and display != d.id:
-        rows.append(("Device", display))
-
-    listing = _listing_name(d)
-    if listing:
-        rows.append(("Listing", listing))
-
-    entry = _entry_point_name(d)
-    if entry and entry != display:
-        rows.append(("Entry point", entry))
-
-    detail = _entry_details(d)
-    if detail:
-        rows.append(("Entry details", detail))
-
-    hardware = _hardware_label(d)
-    if hardware and hardware not in {display, entry}:
-        rows.append(("Hardware name", hardware))
-
-    rows.append(("Device ID", d.id))
-    battery = f"{d.battery}%" if d.battery is not None else "—"
-    rows.append(("Battery", battery))
-    rows.append(("Timestamp (UTC)", time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())))
-    return rows
+        return e["listing"].get("name") or e["listing"].get("title")
+    for k in ("listingName","listing_name","unitName","roomName",
+              "apartmentName","propertyName","buildingName"):
+        if isinstance(e.get(k), str) and e[k].strip():
+            return e[k].strip()
+    return ""
 
 
 def _details_table(d: Device) -> str:
+    listing = _listing_name(d)
+    battery = f"{d.battery}%" if d.battery is not None else "—"
+    rows = [
+        ("Device", d.name),
+        ("Listing", listing or "—"),
+        ("Device ID", f"<code>{d.id}</code>"),
+        ("Battery", battery),
+        ("Timestamp (UTC)", time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())),
+    ]
     tr = "".join(
-        f"<tr><td style='padding:4px 8px;color:#666'>{html.escape(label)}</td>"
-        f"<td style='padding:4px 8px'><b>{html.escape(value)}</b></td></tr>"
-        for label, value in _details_rows(d)
+        f"<tr><td style='padding:4px 8px;color:#666'>{k}</td>"
+        f"<td style='padding:4px 8px'><b>{v}</b></td></tr>" for k, v in rows
     )
     return f"<table style='border-collapse:collapse;margin-top:6px'>{tr}</table>"
 
 
 def _details_text(d: Device) -> str:
-    return "\n".join(f"{label}: {value}" for label, value in _details_rows(d))
+    listing = _listing_name(d) or "—"
+    battery = f"{d.battery}%" if d.battery is not None else "—"
+    lines = [
+        f"Device: {d.name}",
+        f"Listing: {listing}",
+        f"Device ID: {d.id}",
+        f"Battery: {battery}",
+        f"Timestamp (UTC): {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())}",
+    ]
+    return "\n".join(lines)
 
 def alert_offline(d: Device, client=None):
-    subject = f"IoT ALERT: {_subject_label(d)} is OFFLINE"
-    friendly = _device_display_label(d)
-    friendly_html = html.escape(friendly)
+    subject = f"IoT ALERT: {d.name} is OFFLINE"
     html = (
-        "<h3 style='margin:0 0 8px'>Device offline</h3>"
-        f"<p style='margin:0 0 12px'>We stopped receiving updates from "
-        f"<b>{friendly_html}</b>. Please verify the lock, hub, or network.</p>"
-        f"<p style='margin:0 0 12px;color:#b00020;font-weight:bold'>OFFLINE</p>"
+        f"<h3>Device offline</h3>"
+        f"<p><b style='color:#b00020'>OFFLINE</b></p>"
         f"{_details_table(d)}"
     )
-    text = (
-        "Device offline\n"
-        f"We stopped receiving updates from {friendly}.\n\n"
-        f"{_details_text(d)}"
-    )
+    text = "Device offline\n" + _details_text(d)
     return send_email(subject, html, text_body=text, client=client)
 
 def alert_recovered(d: Device, client=None):
-    subject = f"IoT NOTICE: {_subject_label(d)} recovered (online)"
-    friendly = _device_display_label(d)
-    friendly_html = html.escape(friendly)
+    subject = f"IoT NOTICE: {d.name} recovered (online)"
     html = (
-        "<h3 style='margin:0 0 8px'>Device recovered</h3>"
-        f"<p style='margin:0 0 12px'>Connectivity has been restored for "
-        f"<b>{friendly_html}</b>.</p>"
-        f"<p style='margin:0 0 12px;color:green;font-weight:bold'>ONLINE</p>"
+        f"<h3>Device recovered</h3>"
+        f"<p><b style='color:green'>ONLINE</b></p>"
         f"{_details_table(d)}"
     )
-    text = (
-        "Device recovered\n"
-        f"Connectivity has been restored for {friendly}.\n\n"
-        f"{_details_text(d)}"
-    )
+    text = "Device recovered\n" + _details_text(d)
     return send_email(subject, html, text_body=text, client=client)
 
 def alert_low_battery(d: Device, client=None):
-    subject = f"IoT WARNING: {_subject_label(d)} low battery ({d.battery}%)"
-    friendly = _device_display_label(d)
-    friendly_html = html.escape(friendly)
+    subject = f"IoT WARNING: {d.name} low battery ({d.battery}%)"
     html = (
-        "<h3 style='margin:0 0 8px'>Low battery</h3>"
-        f"<p style='margin:0 0 12px'>The reported battery level for "
-        f"<b>{friendly_html}</b> is at or below the configured threshold.</p>"
+        f"<h3>Low battery</h3>"
         f"{_details_table(d)}"
     )
-    text = (
-        "Low battery\n"
-        f"The reported battery level for {friendly} is at or below the configured threshold.\n\n"
-        f"{_details_text(d)}"
-    )
+    text = "Low battery\n" + _details_text(d)
     return send_email(subject, html, text_body=text, client=client)
 
 def main():
