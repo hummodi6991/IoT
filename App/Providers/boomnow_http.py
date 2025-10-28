@@ -20,7 +20,9 @@ ONLY_ACTIVE = str(os.environ.get("BOOMNOW_ONLY_ACTIVE", "1")).strip().lower() in
 ONLY_MANAGED = str(os.environ.get("BOOMNOW_ONLY_MANAGED", "1")).strip().lower() in _ENV_TRUTHY
 STRICT_UI_COLOR = (os.environ.get("BOOMNOW_STRICT_UI_COLOR", "0") == "1")
 STRICT_UI = (os.environ.get("BOOMNOW_STRICT_UI", "0") == "1")
+# Optional dot-paths to customize friendly names and listing titles.
 NAME_FIELD = (os.environ.get("BOOMNOW_NAME_FIELD") or "").strip()
+LISTING_FIELD = (os.environ.get("BOOMNOW_LISTING_FIELD") or "").strip()
 # Force “UI color only” logic:
 # When set, we ignore boolean/text fields and base status ONLY on a color
 # value like "green"/"red" (or "success"/"danger"/"error").
@@ -128,8 +130,11 @@ def _truthy(v: Any) -> bool:
         return lowered in {"1", "true", "yes", "on", "active", "connected", "online", "y"}
     return bool(v)
 
-def _get_bool_path(item: Dict[str, Any], path: str) -> bool:
-    return _truthy(_get_by_path(item, path))
+def _get_bool_path(item: Dict[str, Any], path: str) -> Union[bool, None]:
+    value = _get_by_path(item, path)
+    if value is None:
+        return None
+    return _truthy(value)
 
 def _from_ui_color_dictish(v: Any) -> Any:
     """Unwrap tiny dicts used for indicators: {color|text|name|value: 'green'}."""
@@ -194,6 +199,8 @@ def _has_capability(item: Dict[str, Any], cap: str) -> bool:
         caps = []
 
     normalized = [c.strip().lower() for c in caps if c and c.strip()]
+    if not normalized:
+        return True
     return cap.lower() in normalized
 
 def _enumerate_array_paths(o: Any, prefix: str = "") -> List[str]:
@@ -962,26 +969,49 @@ class BoomNowHttpProvider(DeviceStatusProvider):
                 or item.get("serial_number")
                 or ""
             )
-            name = (
-                item.get("name")
-                or item.get("label")
-                or item.get("deviceName")
-                or item.get("device")
-                or item.get("device_label")
-                or item.get("deviceLabel")
-                or item.get("roomName")
-                or item.get("unitName")
-                or did
-            )
-            if NAME_FIELD:
-                name = _get_by_path(item, NAME_FIELD) or name
+            def _best_name(it: Dict[str, Any]) -> str:
+                """Return the nicest name we can find for a device."""
+                if NAME_FIELD:
+                    override = _get_by_path(it, NAME_FIELD)
+                    if isinstance(override, str) and override.strip():
+                        return override.strip()
+
+                for key in (
+                    "name",
+                    "label",
+                    "deviceName",
+                    "device",
+                    "device_label",
+                    "deviceLabel",
+                    "roomName",
+                    "unitName",
+                    "displayName",
+                    "nickname",
+                ):
+                    value = it.get(key)
+                    if isinstance(value, str) and value.strip():
+                        return value.strip()
+
+                listing = it.get("listing")
+                if isinstance(listing, dict):
+                    for key in ("name", "title"):
+                        value = listing.get(key)
+                        if isinstance(value, str) and value.strip():
+                            return value.strip()
+
+                return ""
+
+            name = _best_name(item) or did
 
             in_use = True
             if ONLY_ACTIVE:
-                in_use = in_use and _get_bool_path(item, "boom.active")
+                active_val = _get_bool_path(item, "boom.active")
+                if active_val is False:
+                    in_use = False
             if ONLY_MANAGED:
                 managed_val = _first_present(item, "is_managed", "isManaged")
-                in_use = in_use and _truthy(managed_val)
+                if managed_val is not None and not _truthy(managed_val):
+                    in_use = False
             if REQUIRED_CAPABILITY:
                 in_use = in_use and _has_capability(item, REQUIRED_CAPABILITY)
             if not in_use:
@@ -1087,11 +1117,28 @@ class BoomNowHttpProvider(DeviceStatusProvider):
                 offline_filtered += 1
 
             battery = None
-            for k in ("battery","batteryPercent","battery_percentage","batteryLevel","battery_level"):
+            for k in ("battery", "batteryPercent", "battery_percentage", "batteryLevel", "battery_level"):
                 if k in item and isinstance(item[k], (int, float)):
-                    battery = int(item[k]); break
+                    battery = int(item[k])
+                    break
 
-            out.append(Device(id=did, name=name, online=online, battery=battery, extra=item))
+            battery_text = None
+            for k in ("battery", "batteryLevel", "battery_level"):
+                if k in item and not isinstance(item[k], (int, float)):
+                    text_val = str(item[k]).strip()
+                    if text_val:
+                        battery_text = text_val
+                        break
+
+            extra = dict(item)
+            if LISTING_FIELD:
+                listing_override = _get_by_path(item, LISTING_FIELD)
+                if listing_override:
+                    extra["listingName"] = listing_override
+            if battery_text:
+                extra["batteryText"] = battery_text
+
+            out.append(Device(id=did, name=name, online=online, battery=battery, extra=extra))
 
         if DEBUG_LEVEL >= 1:
             print(

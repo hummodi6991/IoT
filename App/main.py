@@ -1,4 +1,4 @@
-import os, time, traceback
+import os, time, traceback, re
 from typing import Dict
 from app.device import Device
 from app.state import load_state, save_state, now_ts
@@ -23,23 +23,44 @@ def provider():
         raise RuntimeError(f"Unknown PROVIDER: {PROVIDER}")
 
 def _listing_name(d: Device) -> str:
-    e = (d.extra or {})
-    # common patterns from listing-devices
-    if isinstance(e.get("listing"), dict):
-        return e["listing"].get("name") or e["listing"].get("title")
-    for k in ("listingName","listing_name","unitName","roomName",
-              "apartmentName","propertyName","buildingName"):
-        if isinstance(e.get(k), str) and e[k].strip():
-            return e[k].strip()
+    e = d.extra or {}
+    override = e.get("listingName")
+    if isinstance(override, str) and override.strip():
+        return override.strip()
+
+    listing = e.get("listing")
+    if isinstance(listing, dict):
+        name = listing.get("name") or listing.get("title")
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+
+    for k in ("listingName", "listing_name", "unitName", "roomName",
+              "apartmentName", "propertyName", "buildingName"):
+        value = e.get(k)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
     return ""
 
 
-def _details_table(d: Device) -> str:
+_UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def _display_name(d: Device) -> str:
+    if isinstance(d.name, str) and d.name.strip() and not _UUID_RE.match(d.name.strip()):
+        return d.name.strip()
     listing = _listing_name(d)
-    battery = f"{d.battery}%" if d.battery is not None else "—"
+    return listing or d.name
+
+
+def _details_table(d: Device) -> str:
+    listing = _listing_name(d) or "—"
+    if d.battery is not None:
+        battery = f"{d.battery}%"
+    else:
+        battery = (d.extra or {}).get("batteryText") or "No data"
     rows = [
-        ("Device", d.name),
-        ("Listing", listing or "—"),
+        ("Device", _display_name(d)),
+        ("Listing", listing),
         ("Device ID", f"<code>{d.id}</code>"),
         ("Battery", battery),
         ("Timestamp (UTC)", time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())),
@@ -53,9 +74,12 @@ def _details_table(d: Device) -> str:
 
 def _details_text(d: Device) -> str:
     listing = _listing_name(d) or "—"
-    battery = f"{d.battery}%" if d.battery is not None else "—"
+    if d.battery is not None:
+        battery = f"{d.battery}%"
+    else:
+        battery = (d.extra or {}).get("batteryText") or "No data"
     lines = [
-        f"Device: {d.name}",
+        f"Device: {_display_name(d)}",
         f"Listing: {listing}",
         f"Device ID: {d.id}",
         f"Battery: {battery}",
@@ -64,7 +88,7 @@ def _details_text(d: Device) -> str:
     return "\n".join(lines)
 
 def alert_offline(d: Device, client=None):
-    subject = f"IoT ALERT: {d.name} is OFFLINE"
+    subject = f"IoT ALERT: {_display_name(d)} is OFFLINE"
     html = (
         f"<h3>Device offline</h3>"
         f"<p><b style='color:#b00020'>OFFLINE</b></p>"
@@ -74,7 +98,7 @@ def alert_offline(d: Device, client=None):
     return send_email(subject, html, text_body=text, client=client)
 
 def alert_recovered(d: Device, client=None):
-    subject = f"IoT NOTICE: {d.name} recovered (online)"
+    subject = f"IoT NOTICE: {_display_name(d)} recovered (online)"
     html = (
         f"<h3>Device recovered</h3>"
         f"<p><b style='color:green'>ONLINE</b></p>"
@@ -84,7 +108,7 @@ def alert_recovered(d: Device, client=None):
     return send_email(subject, html, text_body=text, client=client)
 
 def alert_low_battery(d: Device, client=None):
-    subject = f"IoT WARNING: {d.name} low battery ({d.battery}%)"
+    subject = f"IoT WARNING: {_display_name(d)} low battery ({d.battery}%)"
     html = (
         f"<h3>Low battery</h3>"
         f"{_details_table(d)}"
