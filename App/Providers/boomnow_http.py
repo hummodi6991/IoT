@@ -970,41 +970,24 @@ class BoomNowHttpProvider(DeviceStatusProvider):
                 or item.get("serial_number")
                 or ""
             )
-            def _best_name(it: Dict[str, Any]) -> str:
-                """Return the nicest name we can find for a device."""
-                if NAME_FIELD:
-                    override = _get_by_path(it, NAME_FIELD)
-                    if isinstance(override, str) and override.strip():
-                        if DEBUG_PROVIDER:
-                            print(f"[diag] name_field_override='{NAME_FIELD}' -> '{override.strip()}'")
-                        return override.strip()
-
-                for key in (
-                    "name",
-                    "label",
-                    "deviceName",
-                    "device",
-                    "device_label",
-                    "deviceLabel",
-                    "roomName",
-                    "unitName",
-                    "displayName",
-                    "nickname",
-                ):
-                    value = it.get(key)
-                    if isinstance(value, str) and value.strip():
-                        return value.strip()
-
-                listing = it.get("listing")
-                if isinstance(listing, dict):
-                    for key in ("name", "title"):
-                        value = listing.get(key)
-                        if isinstance(value, str) and value.strip():
-                            return value.strip()
-
-                return ""
-
-            name = _best_name(item) or did
+            # Optional override via BOOMNOW_NAME_FIELD (e.g. "appearance.name")
+            name = None
+            if NAME_FIELD:
+                nv = _get_by_path(item, NAME_FIELD)
+                if isinstance(nv, str) and nv.strip():
+                    name = nv.strip()
+            if not name:
+                name = (
+                    item.get("name")
+                    or item.get("label")
+                    or item.get("deviceName")
+                    or item.get("device")
+                    or item.get("device_label")
+                    or item.get("deviceLabel")
+                    or item.get("roomName")
+                    or item.get("unitName")
+                    or did
+                )
 
             # Allow override for listing/association names so they show up in emails/UI.
             listing_override = _get_by_path(item, LISTING_FIELD) if LISTING_FIELD else None
