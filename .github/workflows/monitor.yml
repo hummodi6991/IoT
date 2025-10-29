@@ -50,7 +50,7 @@ jobs:
           SUPPRESS_FIRST_RUN: ${{ vars.SUPPRESS_FIRST_RUN }}                  # '1' to suppress alerts on the very first run
           ALERT_BATCH_LIMIT: ${{ vars.ALERT_BATCH_LIMIT }}                    # cap number of alerts per run (e.g., 10)
           BOOMNOW_ONLINE_FIELD: ${{ vars.BOOMNOW_ONLINE_FIELD }}              # optional: override online field name
-          BOOMNOW_NAME_FIELD: ${{ vars.BOOMNOW_NAME_FIELD }}                  # optional: override name field name
+          BOOMNOW_NAME_FIELD: ${{ vars.BOOMNOW_NAME_FIELD }}
           BOOMNOW_COLOR_ONLY: ${{ vars.BOOMNOW_COLOR_ONLY }}                  # '1' to force color-only logic
           BOOMNOW_COLOR_FIELD: ${{ vars.BOOMNOW_COLOR_FIELD }}                # optional dot-path to the color (e.g. status.color)
 
