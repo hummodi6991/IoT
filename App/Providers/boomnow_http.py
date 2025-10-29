@@ -105,6 +105,7 @@ def _join_query(url: str, extra: Union[str, Dict[str, Any]]):
     return url + (("&" if "?" in url else "?") + extra)
 
 def _get_by_path(obj: Any, path: str):
+    """Return obj[a][b][c] for 'a.b.c' if present, else None."""
     if not path:
         return None
     cur = obj
@@ -974,6 +975,8 @@ class BoomNowHttpProvider(DeviceStatusProvider):
                 if NAME_FIELD:
                     override = _get_by_path(it, NAME_FIELD)
                     if isinstance(override, str) and override.strip():
+                        if DEBUG_PROVIDER:
+                            print(f"[diag] name_field_override='{NAME_FIELD}' -> '{override.strip()}'")
                         return override.strip()
 
                 for key in (
@@ -1002,6 +1005,25 @@ class BoomNowHttpProvider(DeviceStatusProvider):
                 return ""
 
             name = _best_name(item) or did
+
+            # Allow override for listing/association names so they show up in emails/UI.
+            listing_override = _get_by_path(item, LISTING_FIELD) if LISTING_FIELD else None
+            if isinstance(listing_override, str) and listing_override.strip():
+                listing_value = listing_override.strip()
+                item.setdefault("listingName", listing_value)
+                if DEBUG_PROVIDER:
+                    print(
+                        "[diag] listing_field_override="
+                        f"'{LISTING_FIELD}' -> '{listing_value}'"
+                    )
+            elif isinstance(listing_override, dict):
+                maybe = listing_override.get("name") or listing_override.get("title")
+                if isinstance(maybe, str) and maybe.strip():
+                    item.setdefault("listingName", maybe.strip())
+            elif isinstance(item.get("listing"), dict):
+                maybe = item["listing"].get("name") or item["listing"].get("title")
+                if isinstance(maybe, str) and maybe.strip():
+                    item.setdefault("listingName", maybe.strip())
 
             in_use = True
             if ONLY_ACTIVE:
