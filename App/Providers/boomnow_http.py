@@ -174,6 +174,56 @@ def _first_present(d: Dict[str, Any], *keys: str) -> Any:
             return d[k]
     return None
 
+def _best_name(it: Dict[str, Any]) -> str:
+    """Return a human-friendly device name from common fields or overrides."""
+    if not isinstance(it, dict):
+        return ""
+
+    if NAME_FIELD:
+        override = _get_by_path(it, NAME_FIELD)
+        if isinstance(override, str) and override.strip():
+            if DEBUG_PROVIDER:
+                print(
+                    f"[diag] name_field_override='{NAME_FIELD}' -> '{override.strip()}'"
+                )
+            return override.strip()
+
+    for key in (
+        "name",
+        "label",
+        "deviceName",
+        "device",
+        "device_label",
+        "deviceLabel",
+        "roomName",
+        "unitName",
+        "displayName",
+        "nickname",
+    ):
+        value = it.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    props = it.get("properties")
+    if isinstance(props, dict):
+        for key in ("lock_alias", "name"):
+            value = props.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+    lock_alias = it.get("lock_alias")
+    if isinstance(lock_alias, str) and lock_alias.strip():
+        return lock_alias.strip()
+
+    listing = it.get("listing")
+    if isinstance(listing, dict):
+        for key in ("name", "title"):
+            value = listing.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+    return ""
+
 def _has_capability(item: Dict[str, Any], cap: str) -> bool:
     if not cap:
         return True
@@ -970,24 +1020,7 @@ class BoomNowHttpProvider(DeviceStatusProvider):
                 or item.get("serial_number")
                 or ""
             )
-            # Optional override via BOOMNOW_NAME_FIELD (e.g. "appearance.name")
-            name = None
-            if NAME_FIELD:
-                nv = _get_by_path(item, NAME_FIELD)
-                if isinstance(nv, str) and nv.strip():
-                    name = nv.strip()
-            if not name:
-                name = (
-                    item.get("name")
-                    or item.get("label")
-                    or item.get("deviceName")
-                    or item.get("device")
-                    or item.get("device_label")
-                    or item.get("deviceLabel")
-                    or item.get("roomName")
-                    or item.get("unitName")
-                    or did
-                )
+            name = _best_name(item) or did
 
             # Allow override for listing/association names so they show up in emails/UI.
             listing_override = _get_by_path(item, LISTING_FIELD) if LISTING_FIELD else None
