@@ -232,9 +232,9 @@
     "online": true
   },
   "ad01f207-9524-4e8d-8e43-2f475dccf5e1": {
-    "last_change_ts": 1762248695.3926833,
-    "last_offline_alert_ts": 1762231249.3918715,
-    "online": true
+    "last_change_ts": 1762921820.7053306,
+    "last_offline_alert_ts": 1762921820.7053306,
+    "online": false
   },
   "af47ee05-d08f-4628-934c-a35e8201dcd6": {
     "last_change_ts": 1761681155.124196,
@@ -333,9 +333,9 @@
     "online": true
   },
   "e1f6f32b-bc55-499d-a575-83a27647f7ad": {
-    "last_change_ts": 1762917599.390275,
+    "last_change_ts": 1762921820.7053306,
     "last_offline_alert_ts": 1762883388.5145311,
-    "online": false
+    "online": true
   },
   "e22ef929-6da3-429e-86ae-88d4190c6d50": {
     "last_change_ts": 1762714790.970415,
