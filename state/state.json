@@ -374,8 +374,8 @@
     "online": false
   },
   "fc40e37e-5bb0-40a3-ad9e-2b60c25d138a": {
-    "last_change_ts": 1763789323.198447,
-    "last_offline_alert_ts": 1763747441.974175,
-    "online": true
+    "last_change_ts": 1763869617.1915522,
+    "last_offline_alert_ts": 1763869617.1915522,
+    "online": false
   }
 }
