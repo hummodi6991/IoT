@@ -220,9 +220,9 @@
     "since": 1761681155.124196
   },
   "a3062446-5bb4-4d73-be12-854ff28849bb": {
-    "last_change_ts": 1764127903.1143174,
+    "last_change_ts": 1764131831.134828,
     "last_offline_alert_ts": 1764122853.898389,
-    "online": true
+    "online": false
   },
   "a365e2c8-5e78-422c-baea-f493b169e0c7": {
     "last_change_ts": 1761681155.124196,
@@ -286,9 +286,9 @@
     "online": false
   },
   "c6a98356-29e9-418f-9cc8-1409e967caa6": {
-    "last_change_ts": 1764127903.1143174,
+    "last_change_ts": 1764131831.134828,
     "last_offline_alert_ts": 1764122853.898389,
-    "online": true
+    "online": false
   },
   "c700438c-afb2-4d83-b5c7-8c38b2a9246b": {
     "last_change_ts": 1761681155.124196,
