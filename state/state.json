@@ -33,9 +33,9 @@
     "online": true
   },
   "2c311fb4-58a6-4797-85eb-7e6c29350ada": {
-    "last_change_ts": 1764996052.3767078,
+    "last_change_ts": 1764998614.774591,
     "last_offline_alert_ts": 1764967515.4535959,
-    "online": true
+    "online": false
   },
   "2edda043-b68c-4fe8-b99b-357b3da11b15": {
     "last_change_ts": 1763649975.62772,
@@ -170,9 +170,9 @@
     "online": true
   },
   "82112883-b404-411b-a1cb-2f3e72da5b64": {
-    "last_change_ts": 1764978973.6464555,
-    "last_offline_alert_ts": 1764939477.167541,
-    "online": true
+    "last_change_ts": 1764998614.774591,
+    "last_offline_alert_ts": 1764998614.774591,
+    "online": false
   },
   "82a7b776-554f-48f7-8f54-5547ba10cb86": {
     "last_change_ts": 1761681155.124196,
