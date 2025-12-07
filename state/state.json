@@ -170,9 +170,9 @@
     "online": true
   },
   "82112883-b404-411b-a1cb-2f3e72da5b64": {
-    "last_change_ts": 1765063355.4682527,
+    "last_change_ts": 1765071585.8876872,
     "last_offline_alert_ts": 1765048646.3307793,
-    "online": true
+    "online": false
   },
   "82a7b776-554f-48f7-8f54-5547ba10cb86": {
     "last_change_ts": 1761681155.124196,
@@ -271,9 +271,9 @@
     "online": true
   },
   "c21c6861-a8f8-4858-98d0-053078ad4969": {
-    "last_change_ts": 1765064315.6368885,
+    "last_change_ts": 1765071585.8876872,
     "last_offline_alert_ts": 1765038805.0659468,
-    "online": true
+    "online": false
   },
   "c36537a5-84d5-4730-b07b-a450a225edba": {
     "last_change_ts": 1761681155.124196,
@@ -319,9 +319,9 @@
     "online": true
   },
   "d25d2780-1d0f-4c46-9c00-695f01f3b27f": {
-    "last_change_ts": 1765063355.4682527,
-    "last_offline_alert_ts": 1765026849.9627721,
-    "online": true
+    "last_change_ts": 1765071585.8876872,
+    "last_offline_alert_ts": 1765071585.8876872,
+    "online": false
   },
   "d38cb530-0b5d-4241-95ee-53c196c382c3": {
     "last_change_ts": 1764233896.6613252,
@@ -382,8 +382,8 @@
     "online": false
   },
   "fc40e37e-5bb0-40a3-ad9e-2b60c25d138a": {
-    "last_change_ts": 1765063355.4682527,
+    "last_change_ts": 1765071585.8876872,
     "last_offline_alert_ts": 1765063355.4682527,
-    "online": false
+    "online": true
   }
 }
