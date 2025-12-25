@@ -9,9 +9,9 @@
     "online": true
   },
   "16f01e0e-a027-4863-9074-48cac2fe94fa": {
-    "last_change_ts": 1766364739.759406,
-    "last_offline_alert_ts": 1766350380.2138226,
-    "online": true
+    "last_change_ts": 1766683601.9751902,
+    "last_offline_alert_ts": 1766683601.9751902,
+    "online": false
   },
   "16f68f71-b149-41b5-9a7a-b52668cffbce": {
     "last_change_ts": 1765795359.5763125,
@@ -34,9 +34,9 @@
     "online": true
   },
   "2c311fb4-58a6-4797-85eb-7e6c29350ada": {
-    "last_change_ts": 1766660947.7600107,
-    "last_offline_alert_ts": 1766620077.0097842,
-    "online": true
+    "last_change_ts": 1766683601.9751902,
+    "last_offline_alert_ts": 1766683601.9751902,
+    "online": false
   },
   "2edda043-b68c-4fe8-b99b-357b3da11b15": {
     "last_change_ts": 1763649975.62772,
@@ -141,9 +141,9 @@
     "online": true
   },
   "672a424d-05e9-4948-8a21-c7f9ad83f2a5": {
-    "last_change_ts": 1763929659.5443995,
-    "last_offline_alert_ts": 1763895514.2226853,
-    "online": true
+    "last_change_ts": 1766683601.9751902,
+    "last_offline_alert_ts": 1766683601.9751902,
+    "online": false
   },
   "677c8bc8-ef89-47d2-b884-0cd1b2f0472b": {
     "last_change_ts": 1762714790.970415,
@@ -175,9 +175,9 @@
     "online": true
   },
   "82112883-b404-411b-a1cb-2f3e72da5b64": {
-    "last_change_ts": 1766469471.5930307,
-    "last_offline_alert_ts": 1766468662.4472942,
-    "online": true
+    "last_change_ts": 1766683601.9751902,
+    "last_offline_alert_ts": 1766683601.9751902,
+    "online": false
   },
   "82a7b776-554f-48f7-8f54-5547ba10cb86": {
     "last_change_ts": 1761681155.124196,
@@ -236,9 +236,9 @@
     "online": true
   },
   "a3ae834b-74de-416c-adb9-da924187685b": {
-    "last_change_ts": 1766469471.5930307,
-    "last_offline_alert_ts": 1766468662.4472942,
-    "online": true
+    "last_change_ts": 1766683601.9751902,
+    "last_offline_alert_ts": 1766683601.9751902,
+    "online": false
   },
   "a6218c15-41d0-4afc-9081-f3875de01fad": {
     "last_change_ts": 1764149543.3516145,
@@ -246,9 +246,9 @@
     "online": true
   },
   "a65e0079-b070-4caf-827b-0ad53eb5e2ff": {
-    "last_change_ts": 1763909695.1894126,
-    "last_offline_alert_ts": 1763902888.9838166,
-    "online": true
+    "last_change_ts": 1766683601.9751902,
+    "last_offline_alert_ts": 1766683601.9751902,
+    "online": false
   },
   "ad01f207-9524-4e8d-8e43-2f475dccf5e1": {
     "last_change_ts": 1766641370.285214,
@@ -280,9 +280,9 @@
     "online": true
   },
   "c21c6861-a8f8-4858-98d0-053078ad4969": {
-    "last_change_ts": 1765077439.6023805,
-    "last_offline_alert_ts": 1765038805.0659468,
-    "online": true
+    "last_change_ts": 1766683601.9751902,
+    "last_offline_alert_ts": 1766683601.9751902,
+    "online": false
   },
   "c36537a5-84d5-4730-b07b-a450a225edba": {
     "last_change_ts": 1761681155.124196,
@@ -295,9 +295,9 @@
     "online": false
   },
   "c6a98356-29e9-418f-9cc8-1409e967caa6": {
-    "last_change_ts": 1766469471.5930307,
-    "last_offline_alert_ts": 1766468662.4472942,
-    "online": true
+    "last_change_ts": 1766683601.9751902,
+    "last_offline_alert_ts": 1766683601.9751902,
+    "online": false
   },
   "c700438c-afb2-4d83-b5c7-8c38b2a9246b": {
     "last_change_ts": 1761681155.124196,
@@ -329,9 +329,9 @@
     "online": true
   },
   "d25d2780-1d0f-4c46-9c00-695f01f3b27f": {
-    "last_change_ts": 1765216036.1699765,
-    "last_offline_alert_ts": 1765214969.1040077,
-    "online": true
+    "last_change_ts": 1766683601.9751902,
+    "last_offline_alert_ts": 1766683601.9751902,
+    "online": false
   },
   "d38cb530-0b5d-4241-95ee-53c196c382c3": {
     "last_change_ts": 1764233896.6613252,
@@ -374,9 +374,9 @@
     "online": true
   },
   "e5c4c13d-cf29-4994-89b1-8695852097c4": {
-    "last_change_ts": 1763929659.5443995,
-    "last_offline_alert_ts": 1763891222.5476654,
-    "online": true
+    "last_change_ts": 1766683601.9751902,
+    "last_offline_alert_ts": 1766683601.9751902,
+    "online": false
   },
   "f2a8724c-c288-4d57-a1a1-387bee5922e9": {
     "last_change_ts": 1762714003.8989189,
