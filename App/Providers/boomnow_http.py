@@ -45,8 +45,11 @@ LOGIN_KIND = (os.environ.get("BOOMNOW_LOGIN_KIND") or "form").lower()  # "json" 
 EMAIL = os.environ.get("BOOMNOW_EMAIL")
 PASSWORD = os.environ.get("BOOMNOW_PASSWORD")
 
-# Runtime limits
-REQ_TIMEOUT = 10
+# --------------------
+# Runtime limits (configurable)
+# --------------------
+REQ_TIMEOUT = int(os.environ.get("BOOMNOW_REQ_TIMEOUT", "30"))
+REQ_RETRIES = int(os.environ.get("BOOMNOW_REQ_RETRIES", "2"))
 ATTEMPT_LIMIT = 120
 
 DEFAULT_HEADERS = {
@@ -664,6 +667,34 @@ def _discover_scope_headers(session: requests.Session) -> Dict[str, str]:
     return headers
 
 # --------------------
+# HTTP helper with retries
+# --------------------
+def _get_with_retries(session: requests.Session, url: str, headers: Dict[str, str], timeout: int):
+    """
+    Perform GET with retry on timeout.
+    Returns Response or None if all retries fail.
+    """
+    last_exc = None
+
+    for attempt in range(REQ_RETRIES + 1):
+        try:
+            return session.get(url, headers=headers, timeout=timeout)
+        except (
+            requests.exceptions.ReadTimeout,
+            requests.exceptions.ConnectTimeout,
+        ) as exc:
+            last_exc = exc
+            if DEBUG_PROVIDER:
+                print(
+                    f"[provider] timeout retry={attempt+1}/{REQ_RETRIES+1} "
+                    f"url={url} err={exc}"
+                )
+            continue
+
+    return None
+
+
+# --------------------
 # Provider
 # --------------------
 class BoomNowHttpProvider(DeviceStatusProvider):
@@ -843,7 +874,12 @@ class BoomNowHttpProvider(DeviceStatusProvider):
                     tried.add(key)
                     attempt += 1
 
-                    r = session.get(full_url, headers=hv, timeout=REQ_TIMEOUT)
+                    r = _get_with_retries(session, full_url, hv, REQ_TIMEOUT)
+
+                    # If all retries failed, continue sweeping candidates
+                    if r is None:
+                        continue
+
                     ct = r.headers.get("content-type")
                     if DEBUG_PROVIDER:
                         if attempt == 1:
@@ -919,7 +955,12 @@ class BoomNowHttpProvider(DeviceStatusProvider):
                         continue
                     tried.add(key)
                     attempt += 1
-                    r = session.get(full_url, headers=base_hv, timeout=REQ_TIMEOUT)
+                    r = _get_with_retries(session, full_url, base_hv, REQ_TIMEOUT)
+
+                    # If all retries failed, continue sweeping candidates
+                    if r is None:
+                        continue
+
                     ct = r.headers.get("content-type")
                     if DEBUG_PROVIDER:
                         if attempt == 1:
